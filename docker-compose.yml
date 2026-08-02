@@ -17,5 +17,16 @@ services:
       retries: 10
       start_period: 10s
 
+  api:
+    build: .
+    container_name: quotejar-api
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   pgdata:
