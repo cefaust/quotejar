@@ -22,7 +22,8 @@ from app.config import settings
 from app.db import Base
 from app import models  # noqa: F401  -- registers models on Base.metadata
 
-config.set_main_option("sqlalchemy.url", settings.database_url)
+if not config.get_main_option("sqlalchemy.url", None):
+    config.set_main_option("sqlalchemy.url", settings.database_url)
 
 target_metadata = Base.metadata
 
