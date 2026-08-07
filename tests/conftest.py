@@ -12,6 +12,7 @@ from app.config import settings
 from app.db import Base, get_db
 from app.main import app
 from app.models import Child, User
+from app.security import hash_password
 
 TEST_URL = settings.test_database_url
 
@@ -63,9 +64,24 @@ def client(db) -> Generator[TestClient, None, None]:
     app.dependency_overrides.clear()
 
 
+# Hashed once at import, then reused by every fixture below.
+#
+# bcrypt costs ~230 ms per hash by design (see app/security.py). Calling it
+# per-test would add roughly a quarter second to each one -- the whole QJ-1
+# suite currently runs in 0.3 s, so hashing inline would make the tests over
+# ten times slower for no coverage gain. The hashing itself is tested directly
+# in the security tests; fixtures just need *a* valid hash.
+TEST_PASSWORD = "correct-horse-battery"
+TEST_PASSWORD_HASH = hash_password(TEST_PASSWORD)
+
+
 @pytest.fixture
 def child(db) -> Child:
-    user = User(email=f"{uuid.uuid4()}@example.com", display_name="Test Parent")
+    user = User(
+        email=f"{uuid.uuid4()}@example.com",
+        display_name="Test Parent",
+        password_hash=TEST_PASSWORD_HASH,
+    )
     db.add(user)
     db.flush()
     child = Child(user_id=user.id, name="Ada")
