@@ -169,3 +169,59 @@ def create_access_token(user_id: uuid.UUID) -> str:
     }
 
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def decode_access_token(token: str) -> uuid.UUID:
+    """Verify a token's signature and expiry, and return the user id it names.
+
+    Raises jwt.InvalidTokenError (or a subclass) for anything wrong: bad
+    signature, expired, malformed, missing or unusable `sub`. Callers turn
+    that into a 401.
+
+    The `algorithms` argument below is the single most important line here,
+    and passing it explicitly is not boilerplate.
+
+    A JWT's header declares which algorithm signed it. The catastrophic
+    implementation trusts that declaration and verifies using whatever the
+    token asks for. Two attacks follow immediately:
+
+      1. alg: none. The spec defines an "unsecured" mode with an empty
+         signature. An attacker strips the signature, sets alg to "none", and
+         edits the payload to claim any user they like. A library that honours
+         the header accepts it, because the token truthfully declares it is
+         unsigned.
+
+      2. RS256 -> HS256 confusion. On a server using asymmetric keys, the
+         public key is, by design, public. An attacker changes the header to
+         HS256 and signs the forged token with that public key as if it were
+         an HMAC secret. A trusting verifier reaches for "the key" -- the
+         public one -- and the signature checks out.
+
+    Passing an explicit allowlist closes both. We decide what is acceptable
+    before looking at the token; the token gets no say. PyJWT makes the
+    argument mandatory for exactly this reason, which is a good API choosing
+    to be slightly annoying instead of quietly unsafe.
+    """
+    payload = jwt.decode(
+        token,
+        settings.jwt_secret,
+        algorithms=[settings.jwt_algorithm],  # allowlist, never the header
+    )
+
+    # `exp` was already enforced by jwt.decode -- an expired token raised
+    # ExpiredSignatureError before reaching here. Nothing to check manually.
+    subject = payload.get("sub")
+    if subject is None:
+        # A validly signed token with no subject should not exist, since only
+        # create_access_token above mints them. If one turns up, something is
+        # badly wrong; refuse it rather than guessing.
+        raise jwt.InvalidTokenError("token has no subject")
+
+    try:
+        return uuid.UUID(subject)
+    except (ValueError, AttributeError, TypeError) as exc:
+        # Converted rather than allowed to escape. A `sub` that is not a UUID
+        # would otherwise raise ValueError out of the dependency and surface
+        # as a 500 -- an unhandled crash triggered by attacker-controlled
+        # input, and a signal that the input was interesting.
+        raise jwt.InvalidTokenError("token subject is not a valid user id") from exc

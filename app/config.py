@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,7 +24,19 @@ class Settings(BaseSettings):
     # Pydantic raises a ValidationError at import time and the process refuses
     # to start. A crash on deploy is a bad afternoon; a forgeable token is a
     # breach you might not notice for months.
-    jwt_secret: str
+    #
+    # The 32-character floor is RFC 7518 section 3.2: an HMAC key should be at
+    # least as long as the hash it feeds, and SHA-256 outputs 32 bytes. A
+    # shorter key does not make the HMAC construction break, it makes it
+    # brute-forceable -- and cracking the secret offline is far better value
+    # for an attacker than cracking one password, because the secret forges
+    # tokens for every account at once. PyJWT warns about this at runtime;
+    # checking at startup means finding out at deploy rather than in a log
+    # nobody reads.
+    #
+    # Counted in characters rather than bytes, which is marginally stricter
+    # than the RFC for any non-ASCII secret. Erring strict is free here.
+    jwt_secret: str = Field(min_length=32)
 
     # HS256 is symmetric: the same secret both signs and verifies. That fits
     # here because one service does both jobs.

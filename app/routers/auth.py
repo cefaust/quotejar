@@ -26,6 +26,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.dependencies import CurrentUser
 from app.models import User
 from app.schemas import Token, UserCreate, UserRead
 from app.security import create_access_token, hash_password, verify_password
@@ -116,6 +117,19 @@ def login(
         raise _invalid_credentials()
 
     return Token(access_token=create_access_token(user.id))
+
+
+@router.get("/me", response_model=UserRead)
+def read_current_user(user: CurrentUser) -> User:
+    """Return the authenticated user.
+
+    Small, but it earns its place: it is the one route whose entire behaviour
+    is "did the token resolve to somebody", which makes it the natural target
+    for testing every token rejection path without dragging quotes or children
+    into it. Clients also need it to confirm a stored token is still good
+    without attempting a write.
+    """
+    return user
 
 
 def _invalid_credentials() -> HTTPException:
