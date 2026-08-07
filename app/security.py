@@ -4,7 +4,13 @@ Everything here exists to answer one question: when an attacker walks off with
 a dump of the users table, how long do the passwords hold?
 """
 
+import uuid
+from datetime import datetime, timedelta, timezone
+
 import bcrypt
+import jwt
+
+from app.config import settings
 
 # bcrypt operates on at most 72 bytes and, as of bcrypt 4.x, raises ValueError
 # rather than silently truncating. Silent truncation would be worse: a user
@@ -100,3 +106,66 @@ def verify_password(plain: str, hashed: str) -> bool:
         # Failing closed is the point: an unreadable hash must never be
         # mistaken for a match.
         return False
+
+
+def create_access_token(user_id: uuid.UUID) -> str:
+    """Mint a signed access token identifying one user.
+
+    A JWT is three base64url-encoded segments joined by dots:
+
+        eyJhbGciOiJIUzI1NiIs...  .  eyJzdWIiOiI3M2NiMDYy...  .  4fJ8kQ2mNp...
+        └──── header ─────────┘     └──── payload ───────┘     └ signature ┘
+
+    The header names the algorithm. The payload holds the claims. The
+    signature is HMAC-SHA256 over the first two segments using our secret.
+
+    The single most misunderstood fact about JWTs: **the payload is encoded,
+    not encrypted.** base64url is not a cipher -- it has no key, and anyone
+    holding the token can decode the payload with one line of Python or by
+    pasting it into jwt.io. The signature does not hide the contents; it only
+    proves they have not been altered since we signed them.
+
+    Two consequences follow directly, and they are the whole reason this
+    docstring exists:
+
+      1. Never put a secret in the payload. No passwords, no password hashes,
+         no API keys, no private personal data. Treat every claim as public.
+
+      2. Do put whatever the server needs to avoid a database round-trip --
+         that statelessness is the reason to use a JWT at all. But every claim
+         is a snapshot frozen at signing time. Embedding a role or permission
+         means a user demoted a minute ago keeps the old privileges until the
+         token expires, because nothing re-reads the database.
+
+    This payload therefore carries the bare minimum: which user, and until
+    when. The auth dependency looks the user up fresh on every request, so a
+    deleted or changed account takes effect immediately. That costs one
+    indexed primary-key lookup, which is a good trade for not serving stale
+    authorisation.
+    """
+    now = datetime.now(timezone.utc)
+
+    payload = {
+        # "sub" (subject) is a registered claim from RFC 7519 -- the standard
+        # slot for "who this token is about". Using the registered name rather
+        # than a custom "user_id" means any JWT library or debugger already
+        # knows how to read it.
+        #
+        # Stringified because the JWT spec requires sub to be a string. PyJWT
+        # will happily encode a UUID object into JSON-incompatible output or
+        # reject it; converting here keeps the token spec-compliant and makes
+        # the round-trip through uuid.UUID() on the way back explicit.
+        "sub": str(user_id),
+        # "exp" is enforced by PyJWT on decode automatically -- an expired
+        # token raises ExpiredSignatureError rather than quietly validating.
+        # Expiry is checked against the signature, so a client cannot extend
+        # its own token without invalidating it.
+        "exp": now + timedelta(minutes=settings.access_token_expire_minutes),
+        # "iat" (issued at) is not needed to verify anything here. It is
+        # recorded because it is what lets you answer "when was this minted?"
+        # during an incident, and because a future revocation scheme can use
+        # it to reject every token issued before a password change.
+        "iat": now,
+    }
+
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
