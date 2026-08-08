@@ -58,7 +58,19 @@ install will fail with `No matching distribution found for alembic`:
 
     python3.12 -m venv .venv
     source .venv/bin/activate
-    pip install -r requirements.txt
+    pip install -r requirements-dev.txt
+
+Note `requirements-dev.txt`, not `requirements.txt`. The two are split
+because the production image installs `requirements.txt` only:
+
+| File | Contents | Used by |
+| ---- | -------- | ------- |
+| `requirements.txt` | what the running app imports | the Docker image, and pulled in by the dev file |
+| `requirements-dev.txt` | the above plus pytest and the httpx test client | you, locally |
+
+Installing `requirements.txt` alone leaves you without pytest. Shipping
+`requirements-dev.txt` would put a test runner in production, which is code an
+attacker can reach and no user benefits from.
 
 Every command below assumes this virtualenv is active. If you open a new
 terminal tab, run `source .venv/bin/activate` again.
@@ -217,7 +229,7 @@ at `quotejar_test`.
 built with macOS's Python 3.9. Delete it and rebuild with 3.12:
 
     rm -rf .venv && python3.12 -m venv .venv
-    source .venv/bin/activate && pip install -r requirements.txt
+    source .venv/bin/activate && pip install -r requirements-dev.txt
 
 **`Cannot connect to the Docker daemon`** — Docker Desktop is not running.
 Launch it and wait for the whale icon in the menu bar to stop animating.
