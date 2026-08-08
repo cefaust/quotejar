@@ -100,3 +100,28 @@ class Token(BaseModel):
 
     access_token: str
     token_type: str = "bearer"
+
+
+class ChildCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def name_must_not_be_blank(cls, v: str) -> str:
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("name must not be blank")
+        return cleaned
+
+
+class ChildRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    created_at: datetime
+
+    # user_id is deliberately absent. The caller already knows it -- it is
+    # them -- so including it adds nothing, and leaving it out means a bug
+    # that returns someone else's child leaks a name rather than also
+    # confirming which account it belongs to.

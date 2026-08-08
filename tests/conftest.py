@@ -12,7 +12,7 @@ from app.config import settings
 from app.db import Base, get_db
 from app.main import app
 from app.models import Child, User
-from app.security import hash_password
+from app.security import create_access_token, hash_password
 
 TEST_URL = settings.test_database_url
 
@@ -56,14 +56,6 @@ def db(engine) -> Generator[Session, None, None]:
     connection.close()
 
 
-@pytest.fixture
-def client(db) -> Generator[TestClient, None, None]:
-    app.dependency_overrides[get_db] = lambda: db
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
-
-
 # Hashed once at import, then reused by every fixture below.
 #
 # bcrypt costs ~230 ms per hash by design (see app/security.py). Calling it
@@ -75,8 +67,7 @@ TEST_PASSWORD = "correct-horse-battery"
 TEST_PASSWORD_HASH = hash_password(TEST_PASSWORD)
 
 
-@pytest.fixture
-def child(db) -> Child:
+def _make_user(db: Session) -> User:
     user = User(
         email=f"{uuid.uuid4()}@example.com",
         display_name="Test Parent",
@@ -84,7 +75,78 @@ def child(db) -> Child:
     )
     db.add(user)
     db.flush()
+    return user
+
+
+@pytest.fixture
+def user(db) -> User:
+    return _make_user(db)
+
+
+@pytest.fixture
+def other_user(db) -> User:
+    """A second, unrelated account.
+
+    Exists so cross-user tests can be written as "B does X to A's thing"
+    rather than by hand-rolling a second user inside each test. Access-control
+    coverage is only meaningful with two real identities in play.
+    """
+    return _make_user(db)
+
+
+@pytest.fixture
+def anon_client(db) -> Generator[TestClient, None, None]:
+    """A client with no credentials, for asserting endpoints reject anonymity."""
+    app.dependency_overrides[get_db] = lambda: db
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client(db, user) -> Generator[TestClient, None, None]:
+    """A client authenticated as `user`.
+
+    Authenticated by default, deliberately. Every endpoint except register and
+    login now requires a token, so an unauthenticated client is the exception
+    rather than the norm -- and a fixture that makes the common case the
+    default is one people will actually use. Tests that need anonymity ask for
+    anon_client explicitly, which also makes those tests self-documenting.
+
+    The token is minted directly rather than by POSTing to /auth/login. Going
+    through the endpoint would couple every quotes test to the login handler,
+    so a bug there would redden the entire suite instead of just the login
+    tests. It also avoids a bcrypt verify per test.
+    """
+    app.dependency_overrides[get_db] = lambda: db
+    with TestClient(app) as c:
+        c.headers["Authorization"] = f"Bearer {create_access_token(user.id)}"
+        yield c
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def other_client(db, other_user) -> Generator[TestClient, None, None]:
+    """A client authenticated as `other_user` -- the attacker in IDOR tests."""
+    app.dependency_overrides[get_db] = lambda: db
+    with TestClient(app) as c:
+        c.headers["Authorization"] = f"Bearer {create_access_token(other_user.id)}"
+        yield c
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def child(db, user) -> Child:
     child = Child(user_id=user.id, name="Ada")
+    db.add(child)
+    db.flush()
+    return child
+
+
+@pytest.fixture
+def other_child(db, other_user) -> Child:
+    """A child belonging to the *other* account."""
+    child = Child(user_id=other_user.id, name="Bo")
     db.add(child)
     db.flush()
     return child
