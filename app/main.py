@@ -1,9 +1,11 @@
 from fastapi import FastAPI
 
-from app.routers import quotes
+from app.routers import auth, children, quotes
 
-app = FastAPI(title="QuoteJar API", version="0.1.0")
+app = FastAPI(title="QuoteJar API", version="0.2.0")
 
+app.include_router(auth.router)
+app.include_router(children.router)
 app.include_router(quotes.router)
 
 

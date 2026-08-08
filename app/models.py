@@ -25,7 +25,21 @@ class User(Base):
         server_default=func.gen_random_uuid(),
     )
     email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True)
-    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # The bcrypt output string, which carries its own algorithm, cost, and
+    # salt -- see app/security.py. 60 chars today; String(255) leaves room to
+    # migrate to argon2 later without another column change.
+    #
+    # Named password_hash, not password, so that no one reading a query result
+    # or a log line can mistake this for something reversible.
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # Nullable because registration takes email and password only. There is no
+    # endpoint that collects a display name yet, so requiring one here would
+    # mean inventing a value at signup -- and a derived default like the email
+    # local-part is a product decision, not a schema one. Left NULL until some
+    # future ticket adds a profile endpoint to fill it in.
+    display_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
