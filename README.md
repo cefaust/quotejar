@@ -82,29 +82,28 @@ ten seconds.
 This runs from the host, not from inside a container: the API image ships only
 the `app/` package and has no copy of Alembic or the migration scripts.
 
-### 5. Seed a user and two children
+### 5. Seed a user and two children (optional)
 
-The API has no endpoints for creating users or children yet, but every quote
-needs a valid `child_id`:
+The API creates everything it needs on its own — `POST /auth/register` for an
+account, `POST /children` for a child. This script is a shortcut: it hands you
+a ready-made account with two children already attached, so you can start
+exercising the authenticated endpoints immediately instead of making three
+calls first.
 
     python -m scripts.seed
 
-It prints the child IDs, which you will need to create quotes:
+It prints the child IDs, which you need in order to create quotes:
 
     Ada: 0d6d3637-...
     Bo:  73cb062d-...
 
-The script is idempotent — running it twice will not create duplicates. The
-seeded account is `parent@example.com` with password `seed-password-dev-only`,
-so you can log in as it to exercise the authenticated endpoints by hand.
+The seeded account is `parent@example.com`, password `seed-password-dev-only`.
+The script is idempotent — running it twice will not create duplicates.
 
 If you seeded *before* applying the QJ-2 migration, that account cannot log
 in: the migration backfilled pre-existing users with an unusable credential,
 and there is no password reset. Wipe and re-seed — see [Starting
 over](#starting-over).
-
-Since QJ-2 the API can create children itself via `POST /children`, so this
-script is only a convenience for getting a usable account quickly.
 
 ## Running
 
