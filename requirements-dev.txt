@@ -10,6 +10,14 @@
 # code an attacker can reach that serves no user.
 -r requirements.txt
 
+# Migrations are an operator activity run from a laptop against RDS, never
+# from the Lambda -- see requirement 6 and the runbook. Alembic therefore does
+# not belong in the image, so it lives here with Mako and MarkupSafe, which
+# exist only to render its migration templates.
+alembic==1.18.5
+Mako==1.3.12
+MarkupSafe==3.0.3
+
 # Test runner and its dependencies
 pytest==9.1.1
 iniconfig==2.3.0

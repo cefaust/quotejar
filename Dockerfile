@@ -1,146 +1,89 @@
 # syntax=docker/dockerfile:1
+#
+# QuoteJar as a Lambda container image.
+#
+# The base image is AWS's, and that is not cosmetic. public.ecr.aws/lambda/*
+# ships the Runtime Interface Client -- the loop that long-polls the Lambda
+# Runtime API for an event, invokes your handler, and posts the response back.
+# Without it a container has no way to receive an invocation. It also provides
+# the Runtime Interface Emulator, which is what makes the image runnable
+# locally on port 9000 for testing.
+#
+# Everything below the base image is the same application that runs under
+# uvicorn locally. Mangum adapts ASGI to Lambda's event shape; no FastAPI code
+# changes. See app/lambda_handler.py.
 
 # ---------------------------------------------------------------------------
 # Stage 1: builder
 #
-# Everything needed to *produce* the dependency tree lives here and is thrown
-# away. pip, its wheel cache, setuptools, and any compiler a package needed to
-# build itself never reach the running container.
-#
-# That is not only about size. A production image containing pip is an image
-# where anyone who achieves code execution can install their own tooling from
-# the network. Removing the toolchain removes that step.
+# Dependencies are installed here and copied forward, so pip's cache and
+# metadata never reach the published image. Same base image as the runtime
+# stage, so wheels resolve against the identical platform, Python version, and
+# C library -- building on a different base risks a manylinux wheel that
+# imports locally and fails at cold start.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS builder
+FROM public.ecr.aws/lambda/python:3.12 AS builder
 
-# Dependencies go into their own virtualenv rather than the system site-
-# packages, so the runtime stage can copy one self-contained directory instead
-# of picking paths out of the base image.
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Copied before the application code on purpose. Docker caches layers by their
-# inputs, so as long as this file is unchanged the (slow) install below is
-# reused and only the (fast) code copy re-runs. Copying the source first would
-# invalidate the install on every edit.
 COPY requirements.txt .
 
-# requirements.txt only -- never requirements-dev.txt. pytest and the httpx
-# test client are code an attacker can reach and no user benefits from.
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt \
- # Then remove the installer itself. `python -m venv` puts pip inside the
- # virtualenv, so copying the venv would carry pip into the runtime stage --
- # exactly the package manager this multi-stage build exists to leave behind.
- # Verified: before this line, `which pip` in the final image returned
- # /opt/venv/bin/pip.
- && rm -rf /opt/venv/lib/python3.12/site-packages/pip* \
-           /opt/venv/lib/python3.12/site-packages/setuptools* \
-           /opt/venv/lib/python3.12/site-packages/pkg_resources \
-           /opt/venv/bin/pip*
+# --target rather than a virtualenv: Lambda expects dependencies importable
+# from LAMBDA_TASK_ROOT, and there is no interpreter-activation step in which
+# a venv could be enabled.
+#
+# requirements.txt only -- never requirements-dev.txt. That file carries
+# pytest, the httpx test client, and Alembic. None belong in a function that
+# serves user traffic, and Alembic in particular would imply migrations could
+# run here, which is exactly the thing requirement 6 forbids.
+RUN pip install --no-cache-dir -r requirements.txt --target /deps
 
 
 # ---------------------------------------------------------------------------
 # Stage 2: runtime
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM public.ecr.aws/lambda/python:3.12
 
-# PYTHONDONTWRITEBYTECODE: no .pyc files. The container is cattle -- it is
-#   replaced, never repaired -- so anything written to its local filesystem is
-#   discarded at the next deploy and exists only to make the layer dirty.
-# PYTHONUNBUFFERED: stdout unbuffered, so logs appear when they happen rather
-#   than when a 4 KB buffer fills. Without it, the logs from a container that
-#   crashes are the ones you never see.
+# Lambda's execution environment is read-only apart from /tmp, so bytecode
+# would fail to write anyway. Being explicit avoids the attempt.
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PATH="/opt/venv/bin:$PATH"
+    PYTHONUNBUFFERED=1
 
-# A dedicated unprivileged account. What running as root would actually cost:
-#
-#   - Root inside the container maps to root on the host under the default
-#     runtime. Combined with a container escape -- a kernel bug, a careless
-#     bind mount -- that is host compromise rather than container compromise.
-#   - Root can write anywhere in the filesystem, so an attacker with code
-#     execution can overwrite application code, install a persistent backdoor,
-#     or replace a binary on PATH. As appuser, the application's own files are
-#     read-only to it: it can execute them and cannot modify them.
-#   - Root can bind ports below 1024. Nothing here needs to, and the inability
-#     to is a small barrier to a payload that wants to listen somewhere
-#     unexpected.
-#   - It defeats defence in depth. Every other control assumes an attacker who
-#     lands here is constrained; as root, they are not.
-#
-# --system: no password, no home directory, no login shell.
-RUN groupadd --system --gid 1001 appuser \
- && useradd --system --uid 1001 --gid appuser --no-create-home appuser \
- # The base image ships its own pip in /usr/local, independent of the venv.
- # Removing only the venv's copy would leave `python -m pip` working, so both
- # have to go for the claim above to be true.
- && rm -rf /usr/local/lib/python3.12/site-packages/pip* \
-           /usr/local/lib/python3.12/site-packages/setuptools* \
-           /usr/local/lib/python3.12/site-packages/pkg_resources \
-           /usr/local/bin/pip*
+COPY --from=builder /deps ${LAMBDA_TASK_ROOT}
 
-WORKDIR /code
+# Application code only. No tests, no scripts/ (seed.py inserts a user with a
+# hardcoded password), no alembic/ -- migrations run from a laptop against
+# RDS, never from inside the function.
+COPY app ${LAMBDA_TASK_ROOT}/app
 
-# The dependency tree, already built, with none of the tooling that built it.
-COPY --from=builder /opt/venv /opt/venv
+# The handler, as module.path.attribute. Mangum's callable, not FastAPI's app
+# object -- Lambda invokes this with (event, context), which `app` would not
+# understand.
+#
+# No ENTRYPOINT: the base image already sets it to the Runtime Interface
+# Client, and overriding it would break the invocation loop.
+CMD ["app.lambda_handler.handler"]
 
-# Application code, owned by root and merely readable by appuser. The running
-# process therefore cannot modify its own source.
+# ---------------------------------------------------------------------------
+# On running as a non-root user
 #
-# alembic/ and alembic.ini are included deliberately, even though migrations
-# do NOT run at startup (see CMD). Shipping them means a migration can be run
-# from this exact image -- same code, same Alembic version, same revision
-# graph as the deployment it is migrating for. The alternative, running
-# migrations from a laptop, works right up until the laptop's checkout differs
-# from what is deployed.
+# The previous App Runner image created an unprivileged appuser and ran as it.
+# That is not carried over here, and the reason is worth stating rather than
+# leaving as a silent regression.
 #
-# tests/ and scripts/ are absent. Tests have no business in production, and
-# scripts/seed.py inserts a user with a hardcoded password.
-COPY --chown=root:root ./app ./app
-COPY --chown=root:root ./alembic ./alembic
-COPY --chown=root:root ./alembic.ini ./alembic.ini
-
-USER appuser
-
-# App Runner's default. Overridable so the same image runs anywhere.
-ENV PORT=8080
-EXPOSE 8080
-
-# Readiness, not liveness. A container that cannot reach its database should
-# be pulled from rotation, and this is the signal Docker and Compose surface.
+# Lambda does not expose the container's user as a security boundary the way a
+# long-lived server does. Each execution environment is a dedicated Firecracker
+# microVM with its own kernel, torn down after use and never shared between
+# accounts or functions. There is no host to escape onto that is shared with
+# anyone else, no neighbouring workload in the same kernel, and no persistence
+# across invocations for a foothold to survive in. The filesystem is read-only
+# except /tmp, so the "attacker overwrites application code" scenario that
+# motivates non-root elsewhere cannot happen: the code is not writable by any
+# user, root included.
 #
-# Uses the interpreter already present rather than installing curl, keeping
-# one fewer binary in the image.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import os,sys,urllib.request; p=os.environ.get('PORT','8080'); sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+p+'/health/ready', timeout=4).status==200 else 1)"
-
-# Serve only. Migrations are deliberately NOT run here.
+# The isolation that non-root provided under App Runner is provided here by the
+# execution model instead. Adding a USER directive to a Lambda base image also
+# risks breaking the Runtime Interface Client, which expects to own its
+# directories -- a real failure traded for a theoretical gain.
 #
-# `alembic upgrade head && uvicorn ...` is the tempting one-liner and it is a
-# race as soon as there is more than one instance: every container runs it on
-# boot, concurrently, against the same database. Alembic takes no distributed
-# lock. Two instances read the same current revision, both decide the same
-# migration is pending, and both apply it -- so an ADD COLUMN fails on the
-# second with "column already exists", that container dies, the platform
-# restarts it, and it fails again. A rolling deploy can also leave old and new
-# code running against a schema only one of them understands.
-#
-# It is also wrong in a subtler way: it couples "can this instance serve
-# traffic" to "did a schema change succeed", so a bad migration takes the
-# whole service down rather than failing one controlled step.
-#
-# Migrations are a separate, deliberate action. See the runbook in README.md.
-#
-# A shell is needed to expand ${PORT}; exec form alone cannot do variable
-# substitution. `exec` is what makes that safe: it *replaces* the shell
-# process with uvicorn rather than spawning it as a child, so uvicorn ends up
-# as PID 1 and receives SIGTERM directly.
-#
-# Without `exec`, /bin/sh stays PID 1 with uvicorn beneath it, and sh does not
-# forward signals to its children. The platform's graceful-shutdown request
-# would go to the shell and be ignored, uvicorn would never drain, and the
-# container would be SIGKILLed after the timeout -- dropping every in-flight
-# request on each deploy.
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
+# This is a genuine difference between the two deployment targets and belongs
+# in the PR discussion, not buried in a Dockerfile. It is in README.md too.
+# ---------------------------------------------------------------------------
