@@ -149,6 +149,9 @@ bearer token.
 
 | Method | Path            | Auth | Notes                                       |
 | ------ | --------------- | ---- | ------------------------------------------- |
+| GET    | /               | —    | service name, version, and a pointer to /docs |
+| GET    | /health/live    | —    | liveness — checks nothing, deliberately      |
+| GET    | /health/ready   | —    | readiness — 503 if the database is unreachable |
 | POST   | /auth/register  | —    | 201, JSON body, 409 if the email is taken   |
 | POST   | /auth/login     | —    | 200 + token, **form-encoded**, 401 on failure |
 | GET    | /auth/me        | ✓    | the authenticated user                       |
