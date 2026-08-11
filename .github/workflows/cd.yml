@@ -1,0 +1,207 @@
+name: CD
+
+# Merges to main only. Not tags, not other branches, not pull requests.
+#
+# This matters more than it looks. A pull_request trigger runs workflow code
+# from the contributor's branch, so a PR that edits this file could deploy
+# whatever it liked. Restricting to push-on-main means only code that has
+# already passed CI and gone through branch protection can reach production.
+# The IAM trust policy enforces the same boundary independently -- see below.
+on:
+  push:
+    branches: [main]
+  # Manual re-run, for redeploying the current main without an empty commit.
+  workflow_dispatch:
+
+concurrency:
+  # Never two deploys at once. Without this, two quick merges race and the
+  # Lambda can end up running the *earlier* image, because whichever
+  # update-function-code lands second wins regardless of commit order.
+  group: cd-production
+  cancel-in-progress: false
+
+permissions:
+  # The critical line. `id-token: write` lets the job request a signed OIDC
+  # token from GitHub, which is what it exchanges with AWS STS for temporary
+  # credentials. Without it the job cannot mint a token and the AWS step fails
+  # with "Credentials could not be loaded" -- and the fix looks like a
+  # permissions problem in AWS, which is the wrong place to go looking.
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: quotejar
+  LAMBDA_FUNCTION: quotejar-api
+
+jobs:
+  deploy:
+    name: build, push, deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No access keys anywhere. There is no AWS_ACCESS_KEY_ID secret in this
+      # repository, and adding one would be a regression.
+      #
+      # What happens instead: GitHub mints a short-lived JSON Web Token
+      # describing this exact workflow run -- which repository, which branch,
+      # which event. AWS validates that token's signature against GitHub's
+      # public keys, checks it against the role's trust policy, and returns
+      # credentials valid for one hour.
+      #
+      # What that buys over a stored key: the credential cannot be stolen from
+      # the repository because it is never stored there, it expires on its own,
+      # and it is bound to the workflow run that requested it. A leaked access
+      # key works from anywhere, forever, until a human notices and rotates it.
+      - name: Assume the deployment role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::782747473074:role/quotejar-github-actions
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-${{ github.run_id }}
+
+      - name: Confirm which identity we are
+        run: aws sts get-caller-identity
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The three flags here are not stylistic, they are the difference
+      # between a working deploy and a rejected image.
+      #
+      # Buildx defaults to OCI media types and attaches provenance and SBOM
+      # attestations, which produce a manifest *list*. Lambda rejects that
+      # outright: "The image manifest, config or layer media type for the
+      # source image is not supported." Discovered the hard way in QJ-3; the
+      # verification step below is what keeps it from silently regressing.
+      #
+      # Tagged with the git SHA *and* latest. The SHA tag is the real artifact
+      # identity -- see the deploy step.
+      - name: Build and push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false --sbom=false \
+            --output "type=image,name=${REGISTRY}/${ECR_REPOSITORY}:${{ github.sha }},oci-mediatypes=false,push=true" \
+            .
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false --sbom=false \
+            --output "type=image,name=${REGISTRY}/${ECR_REPOSITORY}:latest,oci-mediatypes=false,push=true" \
+            .
+
+      - name: Verify the manifest is one Lambda accepts
+        run: |
+          MT=$(aws ecr batch-get-image \
+                 --repository-name "${ECR_REPOSITORY}" \
+                 --image-ids imageTag=${{ github.sha }} \
+                 --query 'images[0].imageManifestMediaType' --output text)
+          echo "manifest media type: ${MT}"
+          if [ "${MT}" != "application/vnd.docker.distribution.manifest.v2+json" ]; then
+            echo "::error::Lambda will reject this manifest type"
+            exit 1
+          fi
+
+      # Deployed by SHA, never by :latest.
+      #
+      # `latest` is a mutable pointer. Deploying it means the running function
+      # is "whatever latest meant at the moment the deploy happened", which is
+      # unanswerable afterwards -- you cannot look at production and determine
+      # which commit it is running, and two deploys of "latest" minutes apart
+      # can ship different code with no record of the difference. Rolling back
+      # is equally impossible: there is no earlier `latest` to return to.
+      #
+      # A SHA tag is immutable and traceable in both directions: from a running
+      # function to the exact commit, and from any commit to a deployable
+      # image. `latest` is kept only as a convenience for humans pulling by
+      # hand; nothing automated reads it.
+      - name: Deploy to Lambda
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          aws lambda update-function-code \
+            --function-name "${LAMBDA_FUNCTION}" \
+            --image-uri "${REGISTRY}/${ECR_REPOSITORY}:${{ github.sha }}" \
+            --publish \
+            --query '{Status:LastUpdateStatus,Version:Version}' --output json
+
+      # update-function-code returns as soon as the request is accepted, not
+      # when the new image is live. Smoke-testing immediately would test the
+      # *previous* image and pass while the new one was still rolling out --
+      # a green pipeline that proves nothing.
+      - name: Wait for the update to finish
+        run: |
+          aws lambda wait function-updated-v2 --function-name "${LAMBDA_FUNCTION}"
+          aws lambda get-function-configuration --function-name "${LAMBDA_FUNCTION}" \
+            --query '{State:State,Update:LastUpdateStatus,Image:Code}' --output json || true
+
+      # The deploy is not done until the deployed thing answers.
+      #
+      # /health/ready is the right target rather than /health/live: liveness
+      # only proves the process started, which would pass even if the new
+      # image could not reach the database or failed to read its secrets.
+      # Readiness exercises the whole chain -- cold start, Secrets Manager
+      # through the VPC endpoint, and a real query against RDS.
+      #
+      # Retried, because the first request after a deploy pays a cold start of
+      # 2-3 seconds and can exceed a default client timeout. Retrying a
+      # *health check* is legitimate; what would be wrong is retrying until it
+      # passes with no bound, which would turn a broken deploy into a slow
+      # green build.
+      - name: Smoke test the live endpoint
+        run: |
+          URL=$(aws lambda get-function-url-config \
+                  --function-name "${LAMBDA_FUNCTION}" \
+                  --query FunctionUrl --output text)
+          echo "smoke testing ${URL}health/ready"
+          for attempt in 1 2 3 4 5 6; do
+            BODY=$(curl -sS --max-time 30 "${URL}health/ready" || echo "")
+            echo "  attempt ${attempt}: ${BODY}"
+            if echo "${BODY}" | grep -q '"status":"ready"'; then
+              echo "::notice::deploy verified — ${{ github.sha }} is live and reaching the database"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::smoke test failed — the deployed function is not ready"
+          exit 1
+
+# ---------------------------------------------------------------------------
+# Why migrations do not run in this workflow
+#
+# They cannot, and the reason is a security control we deliberately chose.
+#
+# The RDS security group allows exactly two sources: one admin /32 and the
+# Lambda's security group. GitHub-hosted runners have neither -- they come
+# from a large, published, frequently-changing set of Azure ranges. Letting CI
+# reach the database would mean allowing those ranges, which is close enough
+# to 0.0.0.0/0 to be indistinguishable in practice, and would undo the
+# restriction QJ-3 exists to demonstrate.
+#
+# So migrations are run by an operator from a laptop, before merging the PR
+# that needs them. The exact command is in README.md.
+#
+# The cost, stated plainly: nothing enforces that ordering. Merging a PR whose
+# code expects a column that does not exist yet deploys a function that 500s
+# on every request touching that table. The smoke test above catches the gross
+# case -- if readiness fails the pipeline goes red -- but readiness only runs
+# SELECT 1, so a migration missing one column in one table would pass the
+# smoke test and fail in production.
+#
+# What makes that survivable is writing migrations to be backward-compatible
+# with the currently-running code: add nullable columns, never rename in place,
+# never drop a column in the same release that stops using it. Then the order
+# stops mattering, because both old and new code work against both schemas.
+#
+# The alternative that would let CI run them is a migration Lambda inside the
+# VPC, invoked by this workflow -- the database stays closed, and the runner
+# needs only lambda:InvokeFunction. That is the right answer at the point
+# where manual ordering becomes a real risk, and it is deliberately out of
+# scope here.
+# ---------------------------------------------------------------------------

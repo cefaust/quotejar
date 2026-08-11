@@ -1,5 +1,7 @@
 # QuoteJar
 
+[![CI](https://github.com/cefaust/quotejar/actions/workflows/ci.yml/badge.svg)](https://github.com/cefaust/quotejar/actions/workflows/ci.yml)
+
 Capture the funny things your kids say in under five seconds. At the end of
 the year, the collection exports as a print-ready book.
 
@@ -377,7 +379,134 @@ from your laptop — so the outage locks you out of the box you need to diagnose
 it from. RDS Proxy solves this at larger scale for about $20/month; capping
 concurrency and sizing the pool is the same protection for free.
 
+### CI/CD
+
+Two workflows, in `.github/workflows/`.
+
+**`ci.yml`** runs on every push and every pull request: `ruff check`,
+`ruff format --check`, migrations against a PostgreSQL 16 service container,
+then the full suite. A failing test fails the build. `main` is protected and
+requires this check to pass, so it is not advisory.
+
+**`cd.yml`** runs only on push to `main`. It builds the image, pushes it to
+ECR tagged with the commit SHA, updates the Lambda, waits for the update to
+complete, and smoke-tests the live endpoint. **Manual deploys are no longer
+necessary**; the runbook below is kept for disaster recovery and for the
+initial provisioning a pipeline cannot do for itself.
+
+**No AWS credentials are stored in GitHub.** There is no `AWS_ACCESS_KEY_ID`
+secret in this repository. The deploy job requests a short-lived OIDC token
+from GitHub describing that specific workflow run, and exchanges it with AWS
+STS for credentials valid for one hour, via the role
+`quotejar-github-actions`.
+
+The trust policy is the security boundary:
+
+```json
+"Condition": {
+  "StringEquals": {
+    "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+    "token.actions.githubusercontent.com:sub": "repo:cefaust/quotejar:ref:refs/heads/main"
+  }
+}
+```
+
+`sub` identifies *which workflow context* is asking. Scoped as above, only a
+run on `main` in this repository can assume the role. Scoping it to
+`repo:cefaust/quotejar:*` instead would look nearly identical and be much
+weaker: `*` also matches `ref:refs/heads/anything`, and — worse —
+`pull_request`. Anyone who opens a pull request from a fork could then edit
+the workflow to assume your deployment role and push whatever image they
+liked. The wildcard turns "code that reached main" into "anyone who can open
+a PR".
+
+The role's permissions are scoped too: push only to the `quotejar` ECR
+repository, update only the `quotejar-api` function. It cannot read secrets,
+touch RDS, or modify IAM.
+
+### Rolling back
+
+Every deploy pushes an image tagged with its commit SHA, so every previously
+deployed version is still in ECR and addressable. Rolling back is pointing the
+function at an older tag — no rebuild, no revert commit, no waiting on CI.
+
+```bash
+# What is running right now
+aws lambda get-function --function-name quotejar-api \
+  --query 'Code.ImageUri' --output text
+
+# What is available, newest first
+aws ecr describe-images --repository-name quotejar \
+  --query 'reverse(sort_by(imageDetails,&imagePushedAt))[].{Tags:imageTags,Pushed:imagePushedAt}' \
+  --output table
+
+# Roll back to a specific commit
+ACCT=782747473074
+aws lambda update-function-code --function-name quotejar-api \
+  --image-uri "${ACCT}.dkr.ecr.us-east-1.amazonaws.com/quotejar:<sha>" --publish
+aws lambda wait function-updated-v2 --function-name quotejar-api
+
+# Verify
+URL=$(aws lambda get-function-url-config --function-name quotejar-api --query FunctionUrl --output text)
+curl -s "${URL}health/ready"
+```
+
+**This is why `latest` is not deployed.** `latest` is a mutable pointer: it
+means "whatever was pushed most recently", so a function deployed from it
+cannot tell you which commit it is running, and two deploys of `latest`
+minutes apart can ship different code with no record of the difference. There
+is also no *earlier* `latest` to return to — rolling back requires rebuilding
+the old commit and hoping the build is reproducible. A SHA tag is immutable
+and traceable in both directions. `latest` is kept only for humans pulling by
+hand; nothing automated reads it.
+
+**Rolling back code does not roll back the database.** If the version you are
+returning to predates a migration, it runs against a schema it does not know.
+Additive migrations — new nullable columns, new tables — are safe in both
+directions. A migration that renames or drops is not, and rolling back across
+one needs a forward fix instead.
+
+### Where migrations run, and why
+
+**They run from an operator's laptop, before the PR is merged. Not in CI.**
+
+This is a constraint, not a preference. The RDS security group allows exactly
+two sources: one admin `/32` and the Lambda's security group. GitHub-hosted
+runners have neither — they come from a large, published, frequently-changing
+set of Azure ranges. Allowing them would be close enough to `0.0.0.0/0` to be
+indistinguishable in practice, and would undo the restriction QJ-3 exists to
+demonstrate. Given a choice between weakening the database's network boundary
+and running one command by hand, the command wins.
+
+Running them in the Lambda instead would be worse. Every cold start would race
+every other cold start against the same database; Alembic takes no distributed
+lock, so two containers can read the same revision, both decide a migration is
+pending, and both apply it. It also couples "can this instance serve traffic"
+to "did a schema change succeed."
+
+**The cost, stated plainly:** nothing enforces the ordering. Merging a PR
+whose code expects a column that does not exist yet deploys a function that
+errors on every request touching that table. The smoke test catches the gross
+case — if readiness fails, the pipeline goes red — but readiness only runs
+`SELECT 1`, so a missing column in one table would pass the smoke test and
+fail in production.
+
+**What makes that survivable is writing migrations to be backward-compatible
+with the currently-running code.** Add nullable columns; never rename in
+place, add the new one and backfill; never drop a column in the same release
+that stops using it. Then ordering stops mattering, because both the old and
+new code work against both schemas. That discipline is what the QJ-2
+`password_hash` migration already follows — added nullable, backfilled, then
+constrained.
+
+**The fix, when manual ordering becomes a real risk:** a migration Lambda
+inside the VPC, invoked by the pipeline. The database stays closed and the
+runner needs only `lambda:InvokeFunction`. Deliberately out of scope here.
+
 ### Deploy runbook
+
+Deploys are automatic on merge to `main`. This section is for disaster
+recovery, for the initial provisioning, and for running migrations.
 
 Assumes `aws login` is current and Docker is running.
 
