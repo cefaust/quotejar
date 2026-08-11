@@ -468,40 +468,98 @@ one needs a forward fix instead.
 
 ### Where migrations run, and why
 
-**They run from an operator's laptop, before the PR is merged. Not in CI.**
+**They run from an operator's laptop, before the PR is merged. Not in CI, not
+in the Lambda.**
 
-This is a constraint, not a preference. The RDS security group allows exactly
-two sources: one admin `/32` and the Lambda's security group. GitHub-hosted
-runners have neither — they come from a large, published, frequently-changing
-set of Azure ranges. Allowing them would be close enough to `0.0.0.0/0` to be
-indistinguishable in practice, and would undo the restriction QJ-3 exists to
-demonstrate. Given a choice between weakening the database's network boundary
-and running one command by hand, the command wins.
+#### The options that were considered
 
-Running them in the Lambda instead would be worse. Every cold start would race
-every other cold start against the same database; Alembic takes no distributed
-lock, so two containers can read the same revision, both decide a migration is
-pending, and both apply it. It also couples "can this instance serve traffic"
-to "did a schema change succeed."
+| | Automated | Ordering guaranteed | RDS stays locked | Extra infrastructure |
+| --- | --- | --- | --- | --- |
+| **Manual, pre-merge** (chosen) | no | no | **yes** | none |
+| Migration Lambda in the VPC | yes | yes | **yes** | second function + role |
+| `alembic upgrade` in CI | yes | yes | **no** | none |
+| Self-hosted runner in the VPC | yes | yes | **yes** | an EC2 instance to operate |
+| On Lambda cold start | yes | no | yes | none |
 
-**The cost, stated plainly:** nothing enforces the ordering. Merging a PR
-whose code expects a column that does not exist yet deploys a function that
-errors on every request touching that table. The smoke test catches the gross
-case — if readiness fails, the pipeline goes red — but readiness only runs
-`SELECT 1`, so a missing column in one table would pass the smoke test and
-fail in production.
+**Running it in CI** requires allowing GitHub's runners into the database.
+They come from a large, frequently-changing set of published Azure ranges, so
+in practice that is indistinguishable from opening the database to the
+internet, and it dissolves the control QJ-3 exists to demonstrate.
 
-**What makes that survivable is writing migrations to be backward-compatible
-with the currently-running code.** Add nullable columns; never rename in
-place, add the new one and backfill; never drop a column in the same release
-that stops using it. Then ordering stops mattering, because both the old and
-new code work against both schemas. That discipline is what the QJ-2
-`password_hash` migration already follows — added nullable, backfilled, then
-constrained.
+**Running it on Lambda cold start** is the intuitive answer and the worst one.
+Every cold start would run it concurrently against one database; Alembic takes
+no distributed lock, so two containers read the same revision, both decide a
+migration is pending, and the loser dies on "column already exists." It also
+couples "can this instance serve traffic" to "did a schema change succeed."
 
-**The fix, when manual ordering becomes a real risk:** a migration Lambda
-inside the VPC, invoked by the pipeline. The database stays closed and the
-runner needs only `lambda:InvokeFunction`. Deliberately out of scope here.
+**A self-hosted runner** would work, but it means operating an EC2 instance —
+and self-hosted runners on a *public* repository are a known risk, since a
+pull request from a fork can execute code on a runner that sits inside the
+VPC.
+
+#### Why manual was chosen
+
+**A human should watch the one irreversible step.** Everything else in this
+pipeline is reversible: a bad deploy rolls back by pointing the function at an
+older SHA tag. A dropped column does not come back. Migrations are the single
+deploy step that can destroy data permanently, and automating the irreversible
+step optimises for convenience exactly where convenience is worth least.
+
+**It is the only option that neither weakens nor works around the security
+boundary.** This database is publicly reachable; the security group is the
+whole control. Two of the alternatives preserve it by building infrastructure
+to tunnel around it, and one dissolves it.
+
+**Automating it would not remove the manual path anyway.** Lambda's hard
+900-second ceiling is below what real migrations take. The `password_hash`
+backfill already in this repository hashes per row with bcrypt at ~216 ms, so
+it would time out at roughly **4,000 users** — and index builds, table
+rewrites, and constraint validation on a burstable `db.t4g.micro` are all
+candidates too. A migration Lambda would automate the easy migrations while
+the hard ones still ran by hand, leaving two paths to maintain and a judgement
+call about which to use each time.
+
+**The scale does not justify the machinery.** One developer, one environment,
+deploys measured per week. Automation earns its cost by removing repeated
+human error across many people and many runs.
+
+#### The cost, and when this decision flips
+
+Nothing enforces the ordering. Merging a PR whose code expects a column that
+does not exist yet deploys a function that errors on every request touching
+that table. The smoke test catches the gross case — readiness failing turns
+the pipeline red — but readiness only runs `SELECT 1`, so a missing column in
+one table would pass it and fail in production.
+
+**This becomes a migration Lambda the moment either of these is true:** a
+second person can merge to `main`, or a migration is written that is not
+backward-compatible. Until then the manual step is a deliberate trade, not an
+omission.
+
+#### The part no pipeline can solve
+
+Choosing where migrations run is a *build* decision. Whether a migration is
+safe to deploy is a *design* decision, and it is the one that determines
+whether the deploy actually breaks.
+
+A pipeline controls **ordering**. It cannot remove the **window** in which two
+versions of the code run against one schema. `update-function-code` does not
+swap atomically: warm Lambda instances keep serving the previous image until
+they recycle, so old and new code run side by side against a single schema on
+every deploy. Rolling back makes it worse — the code returns to an older SHA
+and the schema stays where it is.
+
+The control for that is **expand/contract**: never change a thing in place.
+Add the new alongside the old, migrate across several releases, remove the old
+only once nothing reads it. A rename becomes three releases rather than one:
+
+1. **Expand** — add the new column nullable; write both, read the old
+2. **Migrate** — backfill; read the new, still write both
+3. **Contract** — stop writing the old; drop it in a later release
+
+Every step is safe with both versions running, which is what makes deploy
+order stop mattering. The QJ-2 `password_hash` migration already follows this
+shape: added nullable, backfilled, then constrained.
 
 ### Deploy runbook
 

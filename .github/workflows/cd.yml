@@ -175,33 +175,27 @@ jobs:
 # ---------------------------------------------------------------------------
 # Why migrations do not run in this workflow
 #
-# They cannot, and the reason is a security control we deliberately chose.
+# A deliberate choice, not an oversight. Full reasoning and the alternatives
+# considered are in README.md, "Where migrations run, and why". In short:
 #
-# The RDS security group allows exactly two sources: one admin /32 and the
-# Lambda's security group. GitHub-hosted runners have neither -- they come
-# from a large, published, frequently-changing set of Azure ranges. Letting CI
-# reach the database would mean allowing those ranges, which is close enough
-# to 0.0.0.0/0 to be indistinguishable in practice, and would undo the
-# restriction QJ-3 exists to demonstrate.
+#   - A human should watch the one irreversible step. Everything else here
+#     rolls back by pointing at an older SHA tag; a dropped column does not
+#     come back.
+#   - Running them here would mean allowing GitHub's runner IP ranges into
+#     RDS, which in practice dissolves the security group QJ-3 built.
+#   - A migration Lambda inside the VPC would automate the easy cases only.
+#     Lambda's 900-second ceiling is below what real migrations take -- the
+#     password_hash backfill in this repo would time out at ~4,000 users --
+#     so the manual path would still exist for the hard ones.
 #
-# So migrations are run by an operator from a laptop, before merging the PR
-# that needs them. The exact command is in README.md.
+# This flips to a migration Lambda the moment a second person can merge, or a
+# migration is written that is not backward-compatible.
 #
-# The cost, stated plainly: nothing enforces that ordering. Merging a PR whose
-# code expects a column that does not exist yet deploys a function that 500s
-# on every request touching that table. The smoke test above catches the gross
-# case -- if readiness fails the pipeline goes red -- but readiness only runs
-# SELECT 1, so a migration missing one column in one table would pass the
-# smoke test and fail in production.
-#
-# What makes that survivable is writing migrations to be backward-compatible
-# with the currently-running code: add nullable columns, never rename in place,
-# never drop a column in the same release that stops using it. Then the order
-# stops mattering, because both old and new code work against both schemas.
-#
-# The alternative that would let CI run them is a migration Lambda inside the
-# VPC, invoked by this workflow -- the database stays closed, and the runner
-# needs only lambda:InvokeFunction. That is the right answer at the point
-# where manual ordering becomes a real risk, and it is deliberately out of
-# scope here.
+# Worth being clear about what this workflow could never fix, whichever option
+# were chosen: update-function-code does not swap atomically, so warm
+# instances keep serving the previous image while new invocations run the new
+# one. Old and new code run against a single schema on every deploy. Ordering
+# is a build problem; that window is a runtime one, and the control for it is
+# expand/contract migrations -- add alongside, migrate over releases, drop
+# last.
 # ---------------------------------------------------------------------------
