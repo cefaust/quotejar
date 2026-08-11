@@ -1,0 +1,115 @@
+name: CI
+
+# Every push and every pull request. Not just PRs: a push straight to a
+# feature branch should tell you it is broken before you open the PR, and
+# branch protection makes the PR run the deciding check anyway.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# Cancel a running job when the same branch is pushed again. The older run is
+# testing code nobody will merge, and Actions minutes spent on superseded
+# commits are minutes the current commit waits for a runner.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: lint and test
+    runs-on: ubuntu-latest
+
+    # A *service container* is a container the runner starts alongside the job
+    # and tears down after it. This is what replaces `docker compose up -d db`
+    # locally.
+    #
+    # Why the tests can reach it at localhost, which surprises people: the job
+    # steps and the service container share the runner's network namespace via
+    # the published port below. `ports: 5432:5432` maps the container's port
+    # onto the runner host, so from a step's perspective Postgres is simply
+    # listening on localhost:5432. (Had the job itself run inside a container,
+    # the address would be the service's *label* -- `postgres` -- on Docker's
+    # user-defined network instead. It does not, so localhost it is.)
+    #
+    # Pinned to postgres:16 to match RDS. Testing against a different major
+    # version means the thing you tested is not the thing you deploy against.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: quotejar
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: quotejar
+        ports:
+          - 5432:5432
+        # Without a health check the job races the database: steps begin the
+        # moment the container is *created*, not when Postgres is ready to
+        # accept connections, and the first migration fails with "connection
+        # refused" perhaps one run in five. GitHub waits for this to pass
+        # before running any step.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+psycopg://quotejar:postgres@localhost:5432/quotejar
+      TEST_DATABASE_URL: postgresql+psycopg://quotejar:postgres@localhost:5432/quotejar_test
+      # Required by app.config at import, so pytest cannot even collect
+      # without it. A throwaway value: CI signs tokens it then verifies within
+      # the same process and never touches a real secret. It clears the
+      # 32-character floor because the settings model enforces one.
+      JWT_SECRET: ci-only-not-a-real-secret-0123456789abcdef
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # Caches the pip download directory keyed on the requirements files.
+          # Change a pin and the cache correctly misses; change application
+          # code and it correctly hits.
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # Lint before tests. Both must pass, and a lint failure is far cheaper to
+      # diagnose than a test failure, so surfacing it first shortens the loop.
+      - name: Lint (ruff check)
+        run: ruff check .
+
+      # --check makes this an assertion rather than an edit: it reports what
+      # would change and exits non-zero, instead of reformatting files the
+      # runner then throws away.
+      - name: Format (ruff format --check)
+        run: ruff format --check .
+
+      - name: Create the test database
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U quotejar -d quotejar \
+            -c "CREATE DATABASE quotejar_test;"
+
+      # Explicit, even though the suite's session fixture also migrates the
+      # test database. This applies migrations to a *separate, untouched*
+      # database, which is the only thing that proves they run cleanly from
+      # empty in the order they will run against RDS. The fixture drops and
+      # recreates the schema first, so it would happily paper over a migration
+      # that only works when re-applied.
+      - name: Run migrations
+        run: alembic upgrade head
+
+      - name: Run tests
+        run: pytest -q

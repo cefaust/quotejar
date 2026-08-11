@@ -29,8 +29,9 @@ def main() -> None:
             )
             db.add(user)
             db.flush()
-            db.add_all([Child(user_id=user.id, name="Ada"),
-                        Child(user_id=user.id, name="Bo")])
+            db.add_all(
+                [Child(user_id=user.id, name="Ada"), Child(user_id=user.id, name="Bo")]
+            )
             db.commit()
 
         for child in db.scalars(select(Child).where(Child.user_id == user.id)):

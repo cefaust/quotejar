@@ -39,3 +39,6 @@ truststore==0.10.4
 watchfiles==1.2.0
 websockets==17.0.1
 PyYAML==6.0.3
+
+# Lint and format, enforced in CI
+ruff==0.16.2

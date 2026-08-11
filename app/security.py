@@ -5,7 +5,7 @@ a dump of the users table, how long do the passwords hold?
 """
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import bcrypt
 import jwt
@@ -143,7 +143,7 @@ def create_access_token(user_id: uuid.UUID) -> str:
     indexed primary-key lookup, which is a good trade for not serving stale
     authorisation.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     payload = {
         # "sub" (subject) is a registered claim from RFC 7519 -- the standard

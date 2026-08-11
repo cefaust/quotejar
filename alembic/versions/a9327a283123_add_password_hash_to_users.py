@@ -40,18 +40,21 @@ password reset is out of scope for QJ-2. In this repository the only affected
 row is the fixture created by scripts/seed.py, so the cost is nil. On a real
 system this step would be paired with a reset flow.
 """
+
 import secrets
-from typing import Sequence, Union
+from collections.abc import Sequence
+from typing import Union
 
 import bcrypt
 import sqlalchemy as sa
+
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = 'a9327a283123'
-down_revision: Union[str, Sequence[str], None] = '0bad12f9d217'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+revision: str = "a9327a283123"
+down_revision: str | Sequence[str] | None = "0bad12f9d217"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:

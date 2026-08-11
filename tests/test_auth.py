@@ -70,7 +70,9 @@ def test_register_rejects_a_duplicate_email(anon_client):
 
 
 def test_register_rejects_a_malformed_email(anon_client):
-    r = anon_client.post(REGISTER, json={"email": "not-an-email", "password": GOOD_PASSWORD})
+    r = anon_client.post(
+        REGISTER, json={"email": "not-an-email", "password": GOOD_PASSWORD}
+    )
     assert r.status_code == 422
 
 
@@ -118,7 +120,7 @@ def test_login_rejects_an_unknown_email(anon_client):
 
 
 def test_login_failures_are_indistinguishable(anon_client):
-    """"No such user" and "wrong password" must be one answer.
+    """ "No such user" and "wrong password" must be one answer.
 
     Distinguishing them hands an attacker a free oracle for which addresses
     are registered -- the list that gets fed into credential stuffing
@@ -183,7 +185,7 @@ def test_me_rejects_a_garbage_token(anon_client):
 
 
 def test_me_rejects_an_expired_token(anon_client, user):
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     expired = jwt.encode(
         {"sub": str(user.id), "exp": now - dt.timedelta(hours=1), "iat": now},
         settings.jwt_secret,
@@ -196,7 +198,7 @@ def test_me_rejects_an_expired_token(anon_client, user):
 
 def test_me_rejects_a_token_signed_with_another_secret(anon_client, user):
     forged = jwt.encode(
-        {"sub": str(user.id), "exp": dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)},
+        {"sub": str(user.id), "exp": dt.datetime.now(dt.UTC) + dt.timedelta(hours=1)},
         "a-different-secret-at-least-32-chars-long",
         algorithm="HS256",
     )
@@ -224,7 +226,7 @@ def test_all_token_failures_return_the_same_body(anon_client, user):
     """Distinguishing "expired" from "bad signature" tells an attacker probing
     with forgeries that the signing was right and only the timestamp was
     stale -- precise feedback on how close they are."""
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     expired = jwt.encode(
         {"sub": str(user.id), "exp": now - dt.timedelta(hours=1)},
         settings.jwt_secret,

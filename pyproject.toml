@@ -1,0 +1,45 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+# .venv is excluded by ruff's defaults, but naming it is cheap insurance: a
+# lint run that wanders into site-packages produces thousands of findings from
+# code you cannot change, and people respond by disabling the linter.
+exclude = [".venv", ".git"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes -- unused imports, undefined names
+    "I",   # isort -- import ordering
+    "B",   # flake8-bugbear -- likely bugs
+    "UP",  # pyupgrade -- modern syntax for the target version
+    "C4",  # flake8-comprehensions
+]
+
+# E501 (line too long) is off because `ruff format` already enforces line
+# length where it can. Where it cannot -- a long URL in a comment, a docstring
+# quoting an AWS error verbatim -- breaking the line to satisfy a linter makes
+# the text worse. The formatter is the authority on layout; the linter should
+# not second-guess it.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Migration files are generated from alembic/script.py.mako and then edited by
+# hand. The template is kept compliant so new migrations start clean, but
+# already-applied migrations are historical records: rewriting one to satisfy
+# a linter edits a file whose whole value is being an accurate record of what
+# ran against the database. F401 covers the `sqlalchemy as sa` that Alembic's
+# template imports whether or not a given migration uses it.
+"alembic/versions/*" = ["F401"]
+
+# Alembic's env.py imports after configuring logging and the sys.path, which
+# is the structure Alembic itself generates and depends on -- config has to be
+# read before the application package is importable. E402 is right in general
+# and wrong for this one file, so it is scoped to this one file rather than
+# disabled globally.
+"alembic/env.py" = ["E402"]
+
+[tool.ruff.format]
+docstring-code-format = true

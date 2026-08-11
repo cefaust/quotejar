@@ -2,14 +2,14 @@ import uuid
 from collections.abc import Generator
 
 import pytest
-from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from alembic import command
 from app.config import settings
-from app.db import Base, get_db
+from app.db import get_db
 from app.main import app
 from app.models import Child, User
 from app.security import create_access_token, hash_password
