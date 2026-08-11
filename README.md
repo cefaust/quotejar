@@ -593,6 +593,18 @@ image is not supported`. Verify with:
 **2. Run migrations — from your laptop, before deploying the code that needs
 them.**
 
+**There is no standing rule allowing your laptop into the database.** Access is
+granted just before the migration and revoked immediately after, so the
+exposure window is minutes rather than months. Run all three steps together.
+
+*Open access:*
+
+    MYIP=$(curl -s https://checkip.amazonaws.com)
+    aws ec2 authorize-security-group-ingress --group-id sg-0956a5f7b9950e1b2 \
+      --ip-permissions "IpProtocol=tcp,FromPort=5432,ToPort=5432,IpRanges=[{CidrIp=${MYIP}/32,Description='jit migration access'}]"
+
+*Migrate:*
+
     export DATABASE_URL=$(aws secretsmanager get-secret-value \
       --secret-id quotejar/database-url --query SecretString --output text)
     export JWT_SECRET=$(aws secretsmanager get-secret-value \
@@ -601,12 +613,60 @@ them.**
     source .venv/bin/activate
     alembic upgrade head
 
-Your IP must be in the RDS security group. If it has changed since the group
-was created:
+*Close it again — do not skip this:*
 
-    MYIP=$(curl -s https://checkip.amazonaws.com)
-    aws ec2 authorize-security-group-ingress --group-id sg-0956a5f7b9950e1b2 \
-      --ip-permissions "IpProtocol=tcp,FromPort=5432,ToPort=5432,IpRanges=[{CidrIp=${MYIP}/32,Description='admin laptop'}]"
+    aws ec2 revoke-security-group-ingress --group-id sg-0956a5f7b9950e1b2 \
+      --ip-permissions "IpProtocol=tcp,FromPort=5432,ToPort=5432,IpRanges=[{CidrIp=${MYIP}/32}]"
+
+*Confirm only the Lambda reference remains:*
+
+    aws ec2 describe-security-group-rules \
+      --filters Name=group-id,Values=sg-0956a5f7b9950e1b2 \
+      --query 'SecurityGroupRules[?IsEgress==`false`].{Cidr:CidrIpv4,Group:ReferencedGroupInfo.GroupId}' \
+      --output table
+
+#### Why just-in-time rather than a standing rule
+
+A `/32` is narrow at the instant you write it. It is a snapshot, not a
+guarantee — a residential IP changes on a DHCP lease renewal, a router reboot,
+ISP maintenance, or the moment you work from a café, a hotspot, or a VPN.
+
+The failure is asymmetric, and that is what makes a standing rule worse than
+it looks:
+
+- **You losing access is loud.** The next migration hangs and times out.
+- **A stranger gaining it is silent.** The rule still reads
+  `67.183.227.35/32` and still says "admin laptop", but that address now
+  belongs to whoever the ISP handed it to.
+
+The natural fix makes it accumulate. You hit the timeout, add your new IP, and
+move on — leaving the stale rule behind. Four times in a year and the group
+allows five residential addresses, four belonging to strangers, every one of
+them labelled "admin laptop". "Restricted to one `/32`" then describes a
+moment rather than a steady state.
+
+Granting access only for the minutes a migration takes removes the drift
+entirely: there is no long-lived rule to go stale, and forgetting to re-add it
+next time is self-correcting, because the migration simply fails until you do.
+
+#### The database is not defended by the security group alone
+
+Worth being accurate about, since the security group is only the network
+layer:
+
+| Layer | Control |
+| ----- | ------- |
+| Network | one temporary `/32` during migrations, plus the Lambda's SG reference |
+| Transport | `rds.force_ssl = 1` — the **server refuses** non-TLS connections; verified, `sslmode=disable` is rejected |
+| Authentication | 40-character random master password, stored in Secrets Manager, never committed |
+
+Someone who inherited the IP would still need the password, over TLS. The
+security group is the outermost layer, not the only one.
+
+**What would remove the inbound rule entirely:** SSM Session Manager port
+forwarding. RDS becomes private with no CIDR rule at all, and administrative
+access is authenticated by IAM rather than by IP address. That is the
+production answer; just-in-time is the cheap approximation of it.
 
 **3. Point the function at the new image.**
 
@@ -696,12 +756,21 @@ which is correct here and would be catastrophic anywhere real.
 ### Not production-grade, and what would change
 
 **The database is publicly reachable.** `PubliclyAccessible` is true so
-migrations can run from a laptop. The security group restricts access to one
-`/32` and one security-group reference — there is no `0.0.0.0/0` anywhere —
-but the instance still has a public DNS name and anyone who obtains the
-credentials can reach it from anywhere. Properly: private subnets with no
-public IP, administrative access through SSM Session Manager or a bastion, and
-migrations run as a one-off task inside the VPC rather than from a laptop.
+migrations can run from a laptop.
+
+In steady state the security group has **no CIDR rules at all** — only a
+reference to the Lambda's security group. A `/32` for an operator is added
+just before a migration and revoked immediately after, so there is no
+long-lived allowance to go stale (see the runbook). Two further layers sit
+behind it: `rds.force_ssl = 1`, so the server refuses non-TLS connections, and
+a 40-character random master password held in Secrets Manager.
+
+What remains true regardless: the instance has a public DNS name and is
+resolvable from anywhere, so the network layer is doing work that a private
+subnet would make unnecessary. Properly: private subnets with no public IP,
+administrative access through SSM Session Manager port forwarding —
+authenticated by IAM rather than by IP address — and migrations run as a
+one-off task inside the VPC.
 
 **Everything was provisioned as the account root user.** Root cannot be
 scoped, cannot be revoked without disrupting the account, and is constrained
