@@ -1,0 +1,52 @@
+# Everything not copied by the Dockerfile still gets uploaded to the daemon as
+# build context. Before this file existed the context was 95 MB, almost all of
+# it .venv -- macOS-native binaries that would be useless in a Linux image.
+#
+# It is also a safety net. The Dockerfile copies specific paths today, but a
+# future `COPY . .` would otherwise pull .env, with real credentials, into a
+# layer that persists in the image forever regardless of any later deletion.
+
+# Secrets. Config comes from the environment at runtime, never from the image.
+.env
+.env.*
+!.env.example
+
+# Local virtualenvs -- wrong platform, and enormous
+.venv/
+venv/
+
+# Version control and CI
+.git/
+.github/
+.gitignore
+
+# Tests and development tooling
+tests/
+requirements-dev.txt
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Development-only scripts. seed.py inserts a user with a hardcoded password.
+scripts/
+
+# Python bytecode. The ** prefix matters: a bare "__pycache__/" only matches
+# the one at the context root, so app/__pycache__ still slipped into the image
+# and shipped stale host-compiled bytecode.
+**/__pycache__/
+**/*.py[cod]
+*.egg-info/
+
+# Local compose stack; the deployed image is orchestrated by App Runner
+docker-compose.yml
+
+# Editor, OS, and agent noise
+.claude/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Docs -- not needed at runtime
+README.md
+docs/
