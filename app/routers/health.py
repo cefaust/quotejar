@@ -39,12 +39,11 @@ unreachable" — the first question you ask at 3am, and one a combined probe
 cannot answer.
 """
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Response, status
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
 
-from app.db import get_db
+from app.dependencies import DbSession
 
 router = APIRouter(tags=["health"])
 
@@ -65,7 +64,7 @@ def liveness() -> dict[str, str]:
 
 
 @router.get("/health/ready")
-def readiness(response: Response, db: Session = Depends(get_db)) -> dict[str, str]:
+def readiness(response: Response, db: DbSession) -> dict[str, str]:
     """Can this instance actually serve a request?
 
     Every endpoint except the auth-free ones needs the database, so database

@@ -19,14 +19,14 @@ So: "I used FastAPI's OAuth2PasswordRequestForm for the token endpoint," not
 "I implemented OAuth2."
 """
 
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
 
-from app.db import get_db
-from app.dependencies import CurrentUser
+from app.dependencies import CurrentUser, DbSession
 from app.models import User
 from app.schemas import Token, UserCreate, UserRead
 from app.security import create_access_token, hash_password, verify_password
@@ -41,7 +41,7 @@ _DUMMY_HASH = hash_password("a-password-that-is-never-anyone's")
 
 
 @router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
-def register(payload: UserCreate, db: Session = Depends(get_db)) -> User:
+def register(payload: UserCreate, db: DbSession) -> User:
     user = User(
         email=payload.email,
         password_hash=hash_password(payload.password),
@@ -72,10 +72,17 @@ def register(payload: UserCreate, db: Session = Depends(get_db)) -> User:
         # delivery and verification flow that QJ-2 puts out of scope.
         #
         # Login, below, does not have this excuse and does not leak.
+        #
+        # `from None` suppresses the exception chain deliberately, and is not
+        # merely appeasing B904. The chained IntegrityError carries the raw
+        # Postgres message, which names the constraint, the table, and the
+        # conflicting value. That would reach the logs on every duplicate
+        # signup and, if error detail were ever surfaced to clients, the
+        # response. The 409 already says everything a caller should learn.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with that email already exists",
-        )
+        ) from None
 
     db.refresh(user)
     return user
@@ -83,8 +90,8 @@ def register(payload: UserCreate, db: Session = Depends(get_db)) -> User:
 
 @router.post("/login", response_model=Token)
 def login(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db),
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+    db: DbSession,
 ) -> Token:
     """Exchange credentials for an access token.
 

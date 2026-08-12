@@ -120,7 +120,7 @@ def test_token_carries_nothing_but_subject_and_timing():
 
 
 def test_expired_token_is_rejected():
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     expired = jwt.encode(
         {"sub": str(uuid.uuid4()), "exp": now - dt.timedelta(seconds=1), "iat": now},
         settings.jwt_secret,
@@ -134,7 +134,7 @@ def test_token_signed_with_another_secret_is_rejected():
     forged = jwt.encode(
         {
             "sub": str(uuid.uuid4()),
-            "exp": dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1),
+            "exp": dt.datetime.now(dt.UTC) + dt.timedelta(hours=1),
         },
         "a-different-secret-at-least-32-chars-long",
         algorithm="HS256",
@@ -159,10 +159,13 @@ def test_alg_none_forgery_is_rejected():
         return base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
 
     victim = uuid.uuid4()
-    exp = int((dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=365)).timestamp())
-    forged = b64({"alg": "none", "typ": "JWT"}) + "." + b64(
-        {"sub": str(victim), "exp": exp}
-    ) + "."
+    exp = int((dt.datetime.now(dt.UTC) + dt.timedelta(days=365)).timestamp())
+    forged = (
+        b64({"alg": "none", "typ": "JWT"})
+        + "."
+        + b64({"sub": str(victim), "exp": exp})
+        + "."
+    )
 
     with pytest.raises(jwt.InvalidTokenError):
         decode_access_token(forged)
@@ -170,7 +173,7 @@ def test_alg_none_forgery_is_rejected():
 
 def test_token_without_a_subject_is_rejected():
     valid_signature_no_sub = jwt.encode(
-        {"exp": dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)},
+        {"exp": dt.datetime.now(dt.UTC) + dt.timedelta(hours=1)},
         settings.jwt_secret,
         algorithm=settings.jwt_algorithm,
     )
@@ -185,7 +188,7 @@ def test_token_with_a_non_uuid_subject_is_rejected():
     bad_sub = jwt.encode(
         {
             "sub": "definitely-not-a-uuid",
-            "exp": dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1),
+            "exp": dt.datetime.now(dt.UTC) + dt.timedelta(hours=1),
         },
         settings.jwt_secret,
         algorithm=settings.jwt_algorithm,

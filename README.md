@@ -1,5 +1,7 @@
 # QuoteJar
 
+[![CI](https://github.com/cefaust/quotejar/actions/workflows/ci.yml/badge.svg)](https://github.com/cefaust/quotejar/actions/workflows/ci.yml)
+
 Capture the funny things your kids say in under five seconds. At the end of
 the year, the collection exports as a print-ready book.
 
@@ -377,7 +379,192 @@ from your laptop — so the outage locks you out of the box you need to diagnose
 it from. RDS Proxy solves this at larger scale for about $20/month; capping
 concurrency and sizing the pool is the same protection for free.
 
+### CI/CD
+
+Two workflows, in `.github/workflows/`.
+
+**`ci.yml`** runs on every push and every pull request: `ruff check`,
+`ruff format --check`, migrations against a PostgreSQL 16 service container,
+then the full suite. A failing test fails the build. `main` is protected and
+requires this check to pass, so it is not advisory.
+
+**`cd.yml`** runs only on push to `main`. It builds the image, pushes it to
+ECR tagged with the commit SHA, updates the Lambda, waits for the update to
+complete, and smoke-tests the live endpoint. **Manual deploys are no longer
+necessary**; the runbook below is kept for disaster recovery and for the
+initial provisioning a pipeline cannot do for itself.
+
+**No AWS credentials are stored in GitHub.** There is no `AWS_ACCESS_KEY_ID`
+secret in this repository. The deploy job requests a short-lived OIDC token
+from GitHub describing that specific workflow run, and exchanges it with AWS
+STS for credentials valid for one hour, via the role
+`quotejar-github-actions`.
+
+The trust policy is the security boundary:
+
+```json
+"Condition": {
+  "StringEquals": {
+    "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+    "token.actions.githubusercontent.com:sub": "repo:cefaust/quotejar:ref:refs/heads/main"
+  }
+}
+```
+
+`sub` identifies *which workflow context* is asking. Scoped as above, only a
+run on `main` in this repository can assume the role. Scoping it to
+`repo:cefaust/quotejar:*` instead would look nearly identical and be much
+weaker: `*` also matches `ref:refs/heads/anything`, and — worse —
+`pull_request`. Anyone who opens a pull request from a fork could then edit
+the workflow to assume your deployment role and push whatever image they
+liked. The wildcard turns "code that reached main" into "anyone who can open
+a PR".
+
+The role's permissions are scoped too: push only to the `quotejar` ECR
+repository, update only the `quotejar-api` function. It cannot read secrets,
+touch RDS, or modify IAM.
+
+### Rolling back
+
+Every deploy pushes an image tagged with its commit SHA, so every previously
+deployed version is still in ECR and addressable. Rolling back is pointing the
+function at an older tag — no rebuild, no revert commit, no waiting on CI.
+
+```bash
+# What is running right now
+aws lambda get-function --function-name quotejar-api \
+  --query 'Code.ImageUri' --output text
+
+# What is available, newest first
+aws ecr describe-images --repository-name quotejar \
+  --query 'reverse(sort_by(imageDetails,&imagePushedAt))[].{Tags:imageTags,Pushed:imagePushedAt}' \
+  --output table
+
+# Roll back to a specific commit
+ACCT=782747473074
+aws lambda update-function-code --function-name quotejar-api \
+  --image-uri "${ACCT}.dkr.ecr.us-east-1.amazonaws.com/quotejar:<sha>" --publish
+aws lambda wait function-updated-v2 --function-name quotejar-api
+
+# Verify
+URL=$(aws lambda get-function-url-config --function-name quotejar-api --query FunctionUrl --output text)
+curl -s "${URL}health/ready"
+```
+
+**This is why `latest` is not deployed.** `latest` is a mutable pointer: it
+means "whatever was pushed most recently", so a function deployed from it
+cannot tell you which commit it is running, and two deploys of `latest`
+minutes apart can ship different code with no record of the difference. There
+is also no *earlier* `latest` to return to — rolling back requires rebuilding
+the old commit and hoping the build is reproducible. A SHA tag is immutable
+and traceable in both directions. `latest` is kept only for humans pulling by
+hand; nothing automated reads it.
+
+**Rolling back code does not roll back the database.** If the version you are
+returning to predates a migration, it runs against a schema it does not know.
+Additive migrations — new nullable columns, new tables — are safe in both
+directions. A migration that renames or drops is not, and rolling back across
+one needs a forward fix instead.
+
+### Where migrations run, and why
+
+**They run from an operator's laptop, before the PR is merged. Not in CI, not
+in the Lambda.**
+
+#### The options that were considered
+
+| | Automated | Ordering guaranteed | RDS stays locked | Extra infrastructure |
+| --- | --- | --- | --- | --- |
+| **Manual, pre-merge** (chosen) | no | no | **yes** | none |
+| Migration Lambda in the VPC | yes | yes | **yes** | second function + role |
+| `alembic upgrade` in CI | yes | yes | **no** | none |
+| Self-hosted runner in the VPC | yes | yes | **yes** | an EC2 instance to operate |
+| On Lambda cold start | yes | no | yes | none |
+
+**Running it in CI** requires allowing GitHub's runners into the database.
+They come from a large, frequently-changing set of published Azure ranges, so
+in practice that is indistinguishable from opening the database to the
+internet, and it dissolves the control QJ-3 exists to demonstrate.
+
+**Running it on Lambda cold start** is the intuitive answer and the worst one.
+Every cold start would run it concurrently against one database; Alembic takes
+no distributed lock, so two containers read the same revision, both decide a
+migration is pending, and the loser dies on "column already exists." It also
+couples "can this instance serve traffic" to "did a schema change succeed."
+
+**A self-hosted runner** would work, but it means operating an EC2 instance —
+and self-hosted runners on a *public* repository are a known risk, since a
+pull request from a fork can execute code on a runner that sits inside the
+VPC.
+
+#### Why manual was chosen
+
+**A human should watch the one irreversible step.** Everything else in this
+pipeline is reversible: a bad deploy rolls back by pointing the function at an
+older SHA tag. A dropped column does not come back. Migrations are the single
+deploy step that can destroy data permanently, and automating the irreversible
+step optimises for convenience exactly where convenience is worth least.
+
+**It is the only option that neither weakens nor works around the security
+boundary.** This database is publicly reachable; the security group is the
+whole control. Two of the alternatives preserve it by building infrastructure
+to tunnel around it, and one dissolves it.
+
+**Automating it would not remove the manual path anyway.** Lambda's hard
+900-second ceiling is below what real migrations take. The `password_hash`
+backfill already in this repository hashes per row with bcrypt at ~216 ms, so
+it would time out at roughly **4,000 users** — and index builds, table
+rewrites, and constraint validation on a burstable `db.t4g.micro` are all
+candidates too. A migration Lambda would automate the easy migrations while
+the hard ones still ran by hand, leaving two paths to maintain and a judgement
+call about which to use each time.
+
+**The scale does not justify the machinery.** One developer, one environment,
+deploys measured per week. Automation earns its cost by removing repeated
+human error across many people and many runs.
+
+#### The cost, and when this decision flips
+
+Nothing enforces the ordering. Merging a PR whose code expects a column that
+does not exist yet deploys a function that errors on every request touching
+that table. The smoke test catches the gross case — readiness failing turns
+the pipeline red — but readiness only runs `SELECT 1`, so a missing column in
+one table would pass it and fail in production.
+
+**This becomes a migration Lambda the moment either of these is true:** a
+second person can merge to `main`, or a migration is written that is not
+backward-compatible. Until then the manual step is a deliberate trade, not an
+omission.
+
+#### The part no pipeline can solve
+
+Choosing where migrations run is a *build* decision. Whether a migration is
+safe to deploy is a *design* decision, and it is the one that determines
+whether the deploy actually breaks.
+
+A pipeline controls **ordering**. It cannot remove the **window** in which two
+versions of the code run against one schema. `update-function-code` does not
+swap atomically: warm Lambda instances keep serving the previous image until
+they recycle, so old and new code run side by side against a single schema on
+every deploy. Rolling back makes it worse — the code returns to an older SHA
+and the schema stays where it is.
+
+The control for that is **expand/contract**: never change a thing in place.
+Add the new alongside the old, migrate across several releases, remove the old
+only once nothing reads it. A rename becomes three releases rather than one:
+
+1. **Expand** — add the new column nullable; write both, read the old
+2. **Migrate** — backfill; read the new, still write both
+3. **Contract** — stop writing the old; drop it in a later release
+
+Every step is safe with both versions running, which is what makes deploy
+order stop mattering. The QJ-2 `password_hash` migration already follows this
+shape: added nullable, backfilled, then constrained.
+
 ### Deploy runbook
+
+Deploys are automatic on merge to `main`. This section is for disaster
+recovery, for the initial provisioning, and for running migrations.
 
 Assumes `aws login` is current and Docker is running.
 
@@ -406,6 +593,18 @@ image is not supported`. Verify with:
 **2. Run migrations — from your laptop, before deploying the code that needs
 them.**
 
+**There is no standing rule allowing your laptop into the database.** Access is
+granted just before the migration and revoked immediately after, so the
+exposure window is minutes rather than months. Run all three steps together.
+
+*Open access:*
+
+    MYIP=$(curl -s https://checkip.amazonaws.com)
+    aws ec2 authorize-security-group-ingress --group-id sg-0956a5f7b9950e1b2 \
+      --ip-permissions "IpProtocol=tcp,FromPort=5432,ToPort=5432,IpRanges=[{CidrIp=${MYIP}/32,Description='jit migration access'}]"
+
+*Migrate:*
+
     export DATABASE_URL=$(aws secretsmanager get-secret-value \
       --secret-id quotejar/database-url --query SecretString --output text)
     export JWT_SECRET=$(aws secretsmanager get-secret-value \
@@ -414,12 +613,60 @@ them.**
     source .venv/bin/activate
     alembic upgrade head
 
-Your IP must be in the RDS security group. If it has changed since the group
-was created:
+*Close it again — do not skip this:*
 
-    MYIP=$(curl -s https://checkip.amazonaws.com)
-    aws ec2 authorize-security-group-ingress --group-id sg-0956a5f7b9950e1b2 \
-      --ip-permissions "IpProtocol=tcp,FromPort=5432,ToPort=5432,IpRanges=[{CidrIp=${MYIP}/32,Description='admin laptop'}]"
+    aws ec2 revoke-security-group-ingress --group-id sg-0956a5f7b9950e1b2 \
+      --ip-permissions "IpProtocol=tcp,FromPort=5432,ToPort=5432,IpRanges=[{CidrIp=${MYIP}/32}]"
+
+*Confirm only the Lambda reference remains:*
+
+    aws ec2 describe-security-group-rules \
+      --filters Name=group-id,Values=sg-0956a5f7b9950e1b2 \
+      --query 'SecurityGroupRules[?IsEgress==`false`].{Cidr:CidrIpv4,Group:ReferencedGroupInfo.GroupId}' \
+      --output table
+
+#### Why just-in-time rather than a standing rule
+
+A `/32` is narrow at the instant you write it. It is a snapshot, not a
+guarantee — a residential IP changes on a DHCP lease renewal, a router reboot,
+ISP maintenance, or the moment you work from a café, a hotspot, or a VPN.
+
+The failure is asymmetric, and that is what makes a standing rule worse than
+it looks:
+
+- **You losing access is loud.** The next migration hangs and times out.
+- **A stranger gaining it is silent.** The rule still reads
+  `67.183.227.35/32` and still says "admin laptop", but that address now
+  belongs to whoever the ISP handed it to.
+
+The natural fix makes it accumulate. You hit the timeout, add your new IP, and
+move on — leaving the stale rule behind. Four times in a year and the group
+allows five residential addresses, four belonging to strangers, every one of
+them labelled "admin laptop". "Restricted to one `/32`" then describes a
+moment rather than a steady state.
+
+Granting access only for the minutes a migration takes removes the drift
+entirely: there is no long-lived rule to go stale, and forgetting to re-add it
+next time is self-correcting, because the migration simply fails until you do.
+
+#### The database is not defended by the security group alone
+
+Worth being accurate about, since the security group is only the network
+layer:
+
+| Layer | Control |
+| ----- | ------- |
+| Network | one temporary `/32` during migrations, plus the Lambda's SG reference |
+| Transport | `rds.force_ssl = 1` — the **server refuses** non-TLS connections; verified, `sslmode=disable` is rejected |
+| Authentication | 40-character random master password, stored in Secrets Manager, never committed |
+
+Someone who inherited the IP would still need the password, over TLS. The
+security group is the outermost layer, not the only one.
+
+**What would remove the inbound rule entirely:** SSM Session Manager port
+forwarding. RDS becomes private with no CIDR rule at all, and administrative
+access is authenticated by IAM rather than by IP address. That is the
+production answer; just-in-time is the cheap approximation of it.
 
 **3. Point the function at the new image.**
 
@@ -509,12 +756,21 @@ which is correct here and would be catastrophic anywhere real.
 ### Not production-grade, and what would change
 
 **The database is publicly reachable.** `PubliclyAccessible` is true so
-migrations can run from a laptop. The security group restricts access to one
-`/32` and one security-group reference — there is no `0.0.0.0/0` anywhere —
-but the instance still has a public DNS name and anyone who obtains the
-credentials can reach it from anywhere. Properly: private subnets with no
-public IP, administrative access through SSM Session Manager or a bastion, and
-migrations run as a one-off task inside the VPC rather than from a laptop.
+migrations can run from a laptop.
+
+In steady state the security group has **no CIDR rules at all** — only a
+reference to the Lambda's security group. A `/32` for an operator is added
+just before a migration and revoked immediately after, so there is no
+long-lived allowance to go stale (see the runbook). Two further layers sit
+behind it: `rds.force_ssl = 1`, so the server refuses non-TLS connections, and
+a 40-character random master password held in Secrets Manager.
+
+What remains true regardless: the instance has a public DNS name and is
+resolvable from anywhere, so the network layer is doing work that a private
+subnet would make unnecessary. Properly: private subnets with no public IP,
+administrative access through SSM Session Manager port forwarding —
+authenticated by IAM rather than by IP address — and migrations run as a
+one-off task inside the VPC.
 
 **Everything was provisioned as the account root user.** Root cannot be
 scoped, cannot be revoked without disrupting the account, and is constrained

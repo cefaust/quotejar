@@ -119,9 +119,7 @@ def test_another_user_cannot_attach_a_quote_to_your_child(other_client, child):
     child_id arrives in the request body, so it is entirely attacker-
     controlled. Checking only that the child exists is not enough.
     """
-    r = other_client.post(
-        QUOTES, json={"child_id": str(child.id), "text": "not yours"}
-    )
+    r = other_client.post(QUOTES, json={"child_id": str(child.id), "text": "not yours"})
     assert r.status_code == 404
 
 
@@ -141,9 +139,7 @@ def test_creating_a_child_ignores_a_client_supplied_user_id(
     could plant records in any account by editing a single field -- and the
     request would look entirely ordinary in the logs.
     """
-    r = other_client.post(
-        CHILDREN, json={"name": "Injected", "user_id": str(user.id)}
-    )
+    r = other_client.post(CHILDREN, json={"name": "Injected", "user_id": str(user.id)})
 
     assert r.status_code == 201
     child_id = r.json()["id"]

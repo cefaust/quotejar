@@ -112,7 +112,5 @@ class Quote(Base):
     child: Mapped["Child"] = relationship(back_populates="quotes")
 
     __table_args__ = (
-        CheckConstraint(
-            "length(btrim(text)) > 0", name="ck_quotes_text_not_blank"
-        ),
+        CheckConstraint("length(btrim(text)) > 0", name="ck_quotes_text_not_blank"),
     )

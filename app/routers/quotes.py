@@ -29,14 +29,12 @@ even in principle.
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from sqlalchemy import Select, func, select
-from sqlalchemy.orm import Session
 
-from app.db import get_db
-from app.dependencies import CurrentUser
+from app.dependencies import CurrentUser, DbSession
 from app.models import Child, Quote
 from app.schemas import QuoteCreate, QuotePage, QuoteRead
 
@@ -104,9 +102,7 @@ def _not_found() -> HTTPException:
 
 
 @router.post("", response_model=QuoteRead, status_code=status.HTTP_201_CREATED)
-def create_quote(
-    payload: QuoteCreate, user: CurrentUser, db: Session = Depends(get_db)
-) -> Quote:
+def create_quote(payload: QuoteCreate, user: CurrentUser, db: DbSession) -> Quote:
     # The child_id arrives in the request body, which makes it attacker-
     # controlled. Checking only that the child exists -- QJ-1's behaviour --
     # would let anyone attach quotes to anyone else's child by guessing or
@@ -116,9 +112,7 @@ def create_quote(
     # The user_id predicate makes another user's child indistinguishable from
     # a nonexistent one, so the 404 below covers both without disclosing which.
     child = db.scalar(
-        select(Child).where(
-            Child.id == payload.child_id, Child.user_id == user.id
-        )
+        select(Child).where(Child.id == payload.child_id, Child.user_id == user.id)
     )
     if child is None:
         raise HTTPException(status_code=404, detail="Child not found")
@@ -133,10 +127,10 @@ def create_quote(
 @router.get("", response_model=QuotePage)
 def list_quotes(
     user: CurrentUser,
+    db: DbSession,
     child_id: uuid.UUID | None = None,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
 ) -> QuotePage:
     filters = [Child.user_id == user.id, Quote.deleted_at.is_(None)]
 
@@ -179,9 +173,7 @@ def list_quotes(
 
 
 @router.get("/{quote_id}", response_model=QuoteRead)
-def get_quote(
-    quote_id: uuid.UUID, user: CurrentUser, db: Session = Depends(get_db)
-) -> Quote:
+def get_quote(quote_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Quote:
     # Ownership is a WHERE clause, not an if-statement after the fetch.
     #
     # Fetching first and checking after works, but it leaves a window: the row
@@ -195,13 +187,11 @@ def get_quote(
 
 
 @router.delete("/{quote_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_quote(
-    quote_id: uuid.UUID, user: CurrentUser, db: Session = Depends(get_db)
-) -> Response:
+def delete_quote(quote_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Response:
     quote = db.scalar(_visible_quotes(user.id).where(Quote.id == quote_id))
     if quote is None:
         raise _not_found()
 
-    quote.deleted_at = datetime.now(timezone.utc)
+    quote.deleted_at = datetime.now(UTC)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

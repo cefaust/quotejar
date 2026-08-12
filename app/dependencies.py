@@ -64,7 +64,14 @@ def get_current_user(
         # precise feedback on how close they are. A legitimate client does not
         # need the difference either: the response to any of these is the
         # same, log in again.
-        raise _unauthenticated()
+        #
+        # `from None` is load-bearing here rather than lint appeasement. The
+        # whole point of this handler is that the failure modes are
+        # indistinguishable; chaining the original would put "Signature
+        # verification failed" or "Signature has expired" straight into the
+        # logs beside the request, reconstructing exactly the distinction the
+        # 401 refuses to make.
+        raise _unauthenticated() from None
 
     user = db.get(User, user_id)
     if user is None:
@@ -108,3 +115,22 @@ def _unauthenticated() -> HTTPException:
 # Beyond brevity, it means the auth requirement is a single named thing that
 # can be changed in one place.
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+# The same treatment for the database session.
+#
+# The older FastAPI style is `db: Session = Depends(get_db)` -- a function call
+# evaluated once, at import, and used as a default argument. FastAPI handles
+# that correctly, but it is genuinely unusual Python: mutable or
+# call-evaluated defaults are a well-known footgun, which is why ruff's B008
+# flags all eleven occurrences of it in this codebase.
+#
+# Annotated moves the dependency into the *type* rather than the default, so
+# the parameter has no default at all. That silences B008 by removing the
+# pattern it warns about, not by suppressing the warning -- which matters,
+# because a per-rule ignore would also hide a real accidental call-in-default
+# somewhere else later.
+#
+# It is also what FastAPI's own documentation now recommends, and it composes:
+# `Annotated` types can be aliased, reused, and read by type checkers, where a
+# default-argument Depends cannot.
+DbSession = Annotated[Session, Depends(get_db)]

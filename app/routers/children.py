@@ -15,12 +15,10 @@ query rather than a check after the fetch.
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from app.db import get_db
-from app.dependencies import CurrentUser
+from app.dependencies import CurrentUser, DbSession
 from app.models import Child
 from app.schemas import ChildCreate, ChildRead
 
@@ -28,9 +26,7 @@ router = APIRouter(prefix="/children", tags=["children"])
 
 
 @router.post("", response_model=ChildRead, status_code=status.HTTP_201_CREATED)
-def create_child(
-    payload: ChildCreate, user: CurrentUser, db: Session = Depends(get_db)
-) -> Child:
+def create_child(payload: ChildCreate, user: CurrentUser, db: DbSession) -> Child:
     # user_id comes from the token, never from the request body.
     #
     # This is the whole ballgame for write-side access control. If the client
@@ -47,20 +43,16 @@ def create_child(
 
 
 @router.get("", response_model=list[ChildRead])
-def list_children(user: CurrentUser, db: Session = Depends(get_db)) -> list[Child]:
+def list_children(user: CurrentUser, db: DbSession) -> list[Child]:
     return list(
         db.scalars(
-            select(Child)
-            .where(Child.user_id == user.id)
-            .order_by(Child.created_at)
+            select(Child).where(Child.user_id == user.id).order_by(Child.created_at)
         ).all()
     )
 
 
 @router.get("/{child_id}", response_model=ChildRead)
-def get_child(
-    child_id: uuid.UUID, user: CurrentUser, db: Session = Depends(get_db)
-) -> Child:
+def get_child(child_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Child:
     child = db.scalar(
         select(Child).where(Child.id == child_id, Child.user_id == user.id)
     )
