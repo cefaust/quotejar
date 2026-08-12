@@ -406,10 +406,44 @@ The trust policy is the security boundary:
 "Condition": {
   "StringEquals": {
     "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-    "token.actions.githubusercontent.com:sub": "repo:cefaust/quotejar:ref:refs/heads/main"
+    "token.actions.githubusercontent.com:sub":
+      "repo:cefaust@101376746/quotejar@1322374978:ref:refs/heads/main"
   }
 }
 ```
+
+**Note the numeric IDs, and expect this to cost you an hour if you have not
+seen it.** AWS's documentation, GitHub's documentation, and essentially every
+tutorial show the subject as `repo:OWNER/REPO:ref:refs/heads/BRANCH`. The token
+this repository actually receives embeds the immutable owner and repository
+database IDs instead:
+
+    repo:cefaust@101376746/quotejar@1322374978:ref:refs/heads/main
+
+A trust policy written to the documented format never matches. STS fails with
+`Not authorized to perform sts:AssumeRoleWithWebIdentity` and deliberately does
+not say *which* condition failed — telling you that would let an attacker probe
+the policy — so it presents as a permissions or thumbprint problem and sends
+you looking in the wrong place.
+
+The IDs are a security improvement, not an inconvenience: names can be released
+and re-registered by someone else, while a database ID cannot, so pinning to
+the ID closes a rename-and-impersonate hole.
+
+**Do not guess at the value — read it.** A step with `id-token: write` can
+print the non-secret claims:
+
+```yaml
+- run: |
+    TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+      "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
+    PAYLOAD=$(echo "$TOKEN" | cut -d. -f2)
+    PAD=$(( (4 - ${#PAYLOAD} % 4) % 4 ))
+    PAYLOAD="${PAYLOAD}$(printf '=%.0s' $(seq 1 $PAD))"
+    echo "$PAYLOAD" | tr '_-' '/+' | base64 -d | jq '{sub, aud, repository, ref}'
+```
+
+Print claims only, never the token.
 
 `sub` identifies *which workflow context* is asking. Scoped as above, only a
 run on `main` in this repository can assume the role. Scoping it to
