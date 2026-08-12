@@ -1,0 +1,275 @@
+"""Rate limiting.
+
+The load-bearing test in this file is
+test_store_unavailable_returns_200_not_500. Fail-open is the behaviour that
+cannot be observed in normal operation -- it only shows up during a DynamoDB
+outage, which is the worst possible moment to discover it regressed. Getting it
+wrong turns a partial outage into a total one, and nothing else in the suite
+would notice.
+"""
+
+import uuid
+
+import pytest
+
+from app.config import settings
+from app.dependencies import limiter
+from app.ratelimit import RateLimiter
+from tests.conftest import MemoryStore
+
+
+class BrokenStore:
+    """A store that is always unreachable, standing in for a DynamoDB outage.
+
+    Raises rather than returning a sentinel, because that is what boto3 does --
+    a botocore ClientError, an endpoint connection error, or an ImportError if
+    the SDK is missing. The limiter must treat all of them alike.
+    """
+
+    def increment(self, key: str, window_seconds: int) -> int:
+        raise ConnectionError("dynamodb unreachable")
+
+    def get(self, key: str) -> int:
+        raise ConnectionError("dynamodb unreachable")
+
+
+@pytest.fixture
+def memory_limiter():
+    """The app's limiter, already on an in-memory store via the autouse
+    isolation fixture in conftest. Named explicitly so the tests that depend on
+    real counting say so."""
+    return limiter
+
+
+@pytest.fixture
+def broken_limiter():
+    original = limiter.store
+    limiter.store = BrokenStore()
+    yield limiter
+    limiter.store = original
+
+
+def _email() -> str:
+    return f"{uuid.uuid4()}@example.com"
+
+
+PASSWORD = "correct-horse-battery"
+
+
+# --- the limiter itself ----------------------------------------------------
+
+
+def test_requests_under_the_limit_are_allowed():
+    rl = RateLimiter(MemoryStore())
+    for _ in range(5):
+        assert rl.check("scope", "id", limit=5, window_seconds=60).allowed
+
+
+def test_the_limit_is_enforced():
+    rl = RateLimiter(MemoryStore())
+    for _ in range(5):
+        rl.check("scope", "id", limit=5, window_seconds=60)
+
+    assert not rl.check("scope", "id", limit=5, window_seconds=60).allowed
+
+
+def test_one_identity_does_not_consume_anothers_quota():
+    """The property that makes per-user limiting worth anything.
+
+    If keys collided, one noisy user would throttle everybody, which is a
+    self-inflicted denial of service wearing the costume of a security control.
+    """
+    rl = RateLimiter(MemoryStore())
+    for _ in range(10):
+        rl.check("scope", "noisy-user", limit=5, window_seconds=60)
+
+    assert rl.check("scope", "quiet-user", limit=5, window_seconds=60).allowed
+
+
+def test_scopes_are_independent():
+    """Exhausting the IP limit must not exhaust the per-user limit."""
+    rl = RateLimiter(MemoryStore())
+    for _ in range(10):
+        rl.check("auth-ip", "same-value", limit=5, window_seconds=60)
+
+    assert rl.check("user", "same-value", limit=5, window_seconds=60).allowed
+
+
+def test_the_window_resets(monkeypatch):
+    """Quota returns once the window has passed.
+
+    Time is advanced rather than slept: a test that waits 60 seconds is a test
+    people delete.
+    """
+    import app.ratelimit as rlmod
+
+    now = 1_000_000.0
+    monkeypatch.setattr(rlmod.time, "time", lambda: now)
+
+    rl = RateLimiter(MemoryStore())
+    for _ in range(5):
+        rl.check("scope", "id", limit=5, window_seconds=60)
+    assert not rl.check("scope", "id", limit=5, window_seconds=60).allowed
+
+    # Two windows on, so neither the current nor the previous window carries
+    # any of the old count.
+    now += 120
+    assert rl.check("scope", "id", limit=5, window_seconds=60).allowed
+
+
+def test_the_previous_window_still_counts_across_a_boundary(monkeypatch):
+    """The flaw in fixed-window counting, and why this is a sliding window.
+
+    A fixed window lets an attacker spend the whole limit at 11:59:59 and the
+    whole limit again at 12:00:00 -- 2x the intended rate in two seconds, with
+    both windows individually legal. Weighting the previous window by how much
+    of it still overlaps means those earlier requests are still counted just
+    after the boundary, and the second burst is rejected.
+    """
+    import app.ratelimit as rlmod
+
+    now = 1_000_000.0 - 1  # one second before a window boundary
+    monkeypatch.setattr(rlmod.time, "time", lambda: now)
+
+    rl = RateLimiter(MemoryStore())
+    for _ in range(5):
+        rl.check("scope", "id", limit=5, window_seconds=60)
+
+    now += 2  # just over the boundary: a fixed window would reset here
+    assert not rl.check("scope", "id", limit=5, window_seconds=60).allowed
+
+
+def test_a_decision_reports_the_remaining_quota():
+    rl = RateLimiter(MemoryStore())
+    first = rl.check("scope", "id", limit=5, window_seconds=60)
+
+    assert first.limit == 5
+    assert first.remaining == 4
+    assert 0 < first.reset_seconds <= 60
+
+
+# --- fail open -------------------------------------------------------------
+
+
+def test_the_limiter_allows_requests_when_the_store_is_down():
+    rl = RateLimiter(BrokenStore())
+    decision = rl.check("scope", "id", limit=5, window_seconds=60)
+
+    assert decision.allowed
+    assert decision.remaining == decision.limit
+
+
+def test_a_broken_store_never_blocks_however_many_requests():
+    """Fail-open must not degrade into fail-closed after N attempts."""
+    rl = RateLimiter(BrokenStore())
+    for _ in range(50):
+        assert rl.check("scope", "id", limit=5, window_seconds=60).allowed
+
+
+def test_recording_a_failure_does_not_raise_when_the_store_is_down():
+    """record() runs after a request is handled, so raising here would turn a
+    correct 401 into a 500 -- failing the user because bookkeeping failed."""
+    RateLimiter(BrokenStore()).record("scope", "id", 60)
+
+
+def test_store_unavailable_returns_200_not_500(broken_limiter, client, child):
+    """End to end: a DynamoDB outage must not take the API down.
+
+    The single most important assertion in this file. A limiter that fails
+    closed converts a dependency outage into a total outage, and this is the
+    only test that would catch that regression.
+    """
+    response = client.get("/quotes")
+
+    assert response.status_code == 200
+
+
+def test_login_still_works_when_the_store_is_down(broken_limiter, anon_client, db):
+    email = _email()
+    anon_client.post("/auth/register", json={"email": email, "password": PASSWORD})
+
+    response = anon_client.post(
+        "/auth/login", data={"username": email, "password": PASSWORD}
+    )
+
+    assert response.status_code == 200
+
+
+# --- through the API -------------------------------------------------------
+
+
+def test_repeated_logins_from_one_ip_are_eventually_rejected(
+    memory_limiter, anon_client
+):
+    email = _email()
+    anon_client.post("/auth/register", json={"email": email, "password": PASSWORD})
+
+    codes = [
+        anon_client.post(
+            "/auth/login", data={"username": email, "password": "wrong"}
+        ).status_code
+        for _ in range(settings.auth_ip_limit + 3)
+    ]
+
+    assert 429 in codes, "the per-IP limit never triggered"
+
+
+def test_a_429_carries_retry_after_and_ratelimit_headers(memory_limiter, anon_client):
+    """A 429 with no timing is a bad citizen: it tells a client to stop without
+    saying for how long, so well-behaved clients guess and the rest hammer."""
+    for _ in range(settings.auth_ip_limit + 3):
+        response = anon_client.post(
+            "/auth/login", data={"username": _email(), "password": "wrong"}
+        )
+        if response.status_code == 429:
+            break
+    else:
+        pytest.fail("never got a 429")
+
+    assert "retry-after" in response.headers
+    assert int(response.headers["retry-after"]) > 0
+    assert response.headers["ratelimit-limit"] == str(settings.auth_ip_limit)
+    assert response.headers["ratelimit-remaining"] == "0"
+    assert int(response.headers["ratelimit-reset"]) > 0
+
+
+def test_repeated_failures_against_one_email_are_limited(memory_limiter, anon_client):
+    """The second axis. A botnet defeats the per-IP limit while every attempt
+    still lands on one address."""
+    email = _email()
+    anon_client.post("/auth/register", json={"email": email, "password": PASSWORD})
+
+    for _ in range(settings.auth_email_limit + 1):
+        anon_client.post("/auth/login", data={"username": email, "password": "wrong"})
+
+    # Even with the correct password, the account is now throttled.
+    response = anon_client.post(
+        "/auth/login", data={"username": email, "password": PASSWORD}
+    )
+    assert response.status_code == 429
+
+
+def test_successful_logins_do_not_count_against_the_email_limit(
+    memory_limiter, anon_client
+):
+    """Counting successes would penalise the account's real owner, and would
+    let an attacker throttle someone by logging in wrongly at their address."""
+    email = _email()
+    anon_client.post("/auth/register", json={"email": email, "password": PASSWORD})
+
+    for _ in range(settings.auth_email_limit + 2):
+        response = anon_client.post(
+            "/auth/login", data={"username": email, "password": PASSWORD}
+        )
+
+    assert response.status_code == 200
+
+
+def test_one_users_authenticated_quota_does_not_affect_another(
+    memory_limiter, client, other_client, child
+):
+    """Per-user keying, end to end."""
+    for _ in range(settings.authenticated_limit + 5):
+        client.get("/quotes")
+
+    assert other_client.get("/quotes").status_code == 200

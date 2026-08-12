@@ -833,6 +833,221 @@ image of this size. Nobody notices at this traffic level, and it is the
 explicit tradeoff for paying nothing while idle. Provisioned concurrency
 removes it and reintroduces a constant bill.
 
+## Rate limiting
+
+### The problem it solves
+
+bcrypt costs ~216 ms of CPU per verification, deliberately — that slowness is
+what protects hashes against offline cracking. Pointed at a live endpoint the
+property inverts: an attempt costs an attacker one cheap HTTP request and costs
+us 216 ms of a reserved execution slot. With reserved concurrency of 5, five
+concurrent attackers saturate the function and every real user is throttled.
+No password has to be guessed for the service to go down.
+
+### The limits
+
+| Scope | Keyed on | Limit | Window |
+| ----- | -------- | ----- | ------ |
+| `/auth/login`, `/auth/register` | client IP | 10 | 15 min |
+| failed logins | email address | 5 | 15 min |
+| authenticated endpoints | user ID | 120 | 1 min |
+
+**Why the first two are different limits rather than one.** They protect
+different things and each is blind exactly where the other sees. The IP limit
+protects the *service* from resource exhaustion; the email limit protects an
+*account* from credential stuffing. An attacker with a botnet defeats the IP
+limit while every attempt still lands on one address. Conversely a shared NAT —
+an office, a university, a mobile carrier — puts thousands of innocent users
+behind one address, where a per-IP limit punishes all of them for one. Neither
+substitutes for the other.
+
+**Why the third is keyed on user ID.** After authentication there is something
+better than an address available. A user ID survives a phone moving between
+wifi and cellular, cannot be changed by rotating IPs, and is unaffected by NAT.
+IP is what you use when you do not yet know who is calling; once you do, using
+it anyway throws information away.
+
+**Why the email limit counts failures only.** A user who types their password
+correctly has not attacked anything. Counting successes would penalise the
+account's real owner for using their own account, and would hand an attacker a
+way to throttle someone by deliberately failing at their address.
+
+### Why IP is a weak key at all
+
+Worth being honest that per-IP limiting is the least reliable of the three.
+Carrier-grade NAT puts entire mobile networks behind a handful of addresses, so
+one limit covers thousands of unrelated people. IPv6 privacy extensions rotate
+a client's address regularly, and a residential /64 gives one attacker
+18 quintillion addresses to cycle through. Cloud egress is rentable by the
+hour.
+
+It is used before authentication because there is nothing better — the caller
+has not yet told us who they are. Everything after that point is keyed on
+identity, which is the actual answer to "what would you key on instead".
+
+### Store: DynamoDB, and why not the alternatives
+
+In-process counters cannot work here. Lambda gives up to five execution
+environments, each with its own memory, created and destroyed unpredictably, so
+a per-process counter would grant 5x the intended limit and reset on every cold
+start. The counter has to be shared.
+
+| | Monthly | Why not chosen |
+| --- | --- | --- |
+| **DynamoDB** (chosen) | **~$0** | — |
+| ElastiCache Redis | ~$9–12 | An always-on node for hobby traffic, plus something else to patch, monitor, and remember to tear down. `INCR`/`EXPIRE` is genuinely simpler than conditional writes, and sub-millisecond — it is the better tool, at a standing cost this project cannot justify. |
+| CloudFront + AWS WAF | ~$6+ | **WAF cannot attach to a Lambda Function URL** — the supported targets are CloudFront, API Gateway, ALB, AppSync, Cognito, App Runner, Amplify, and Verified Access. It would mean adding CloudFront as a fronting origin. More decisively, WAF does not decode JWTs, so it cannot key on user ID and cannot satisfy the per-user limit at all — it would be an *additional* layer on top of one of the others, not an alternative. It would also require locking the Function URL to `AWS_IAM` behind Origin Access Control, since otherwise an attacker simply bypasses CloudFront and hits Lambda directly. |
+
+DynamoDB's decisive advantage here is specific to this architecture: the Lambda
+has no route to the internet, so any store must be reachable privately, and
+DynamoDB offers a **Gateway** VPC endpoint, which is free. Compare the Secrets
+Manager *Interface* endpoint at roughly $7/month. Pay-per-request pricing at
+this traffic rounds to nothing, TTL reclaims old counters automatically, and
+there is no instance to operate or tear down.
+
+The honest cost of the choice: conditional-write logic is more code than
+`INCR`, and single-digit-millisecond latency is slower than Redis. Neither
+matters next to a 216 ms bcrypt call.
+
+### Algorithm: sliding window counter
+
+**Fixed window** — one counter per calendar window — is simplest and has a
+specific flaw: an attacker gets *twice* the limit across a boundary. With 10
+per minute they send 10 at 11:59:59 and 10 more at 12:00:00. Both windows are
+individually legal; 20 requests land in two seconds. For a limiter whose job is
+bounding a 216 ms operation, a 2x burst is the difference between bounded and
+unbounded.
+
+**Sliding window log** stores every request timestamp and is exact, but a limit
+of N costs N stored timestamps per key — unbounded write amplification under
+exactly the attack this exists to stop.
+
+**Token bucket** handles bursts gracefully but needs two mutable fields
+updated atomically, which is a read-modify-write rather than a single atomic
+`ADD`.
+
+**Sliding window counter** keeps a counter for the current window and the
+previous one, weighting the previous by how much still overlaps:
+
+    estimate = previous_count × (1 − elapsed_fraction) + current_count
+
+Two small items per key, one atomic increment, no boundary burst. There is a
+test that specifically fires across a window boundary and asserts the second
+burst is rejected.
+
+### Fail open, deliberately
+
+If DynamoDB is unreachable, requests **proceed** and the failure is logged at
+ERROR with a traceback.
+
+The reasoning: a rate limiter is a control on abuse, not a dependency of the
+product. Failing closed would mean a DynamoDB outage takes QuoteJar down
+entirely — converting a partial degradation into a total one, and adding a new
+single point of failure in the name of security. The blast radius of the wrong
+choice is asymmetric: failing open during an outage means a window with no
+limiting, while failing closed means a window with no service.
+
+**The opposite choice is defensible and would be right elsewhere.** If this
+guarded something whose abuse is worse than its unavailability — payment
+authorisation, a password reset flow, anything where an unlimited attempt rate
+is catastrophic — fail closed. The rule of thumb: fail open when the limiter
+protects *capacity*, fail closed when it protects *correctness or money*. Here
+it protects capacity.
+
+What makes fail-open survivable is that the gap is loud. It logs at ERROR with
+a traceback on every failed call, because a fail-open limiter that logs quietly
+is indistinguishable from one that works, and you discover during an incident
+that it has been open for a month. There is a test asserting the API returns
+200 rather than 500 when the store is down — the single most important test in
+the suite, because that behaviour is invisible in normal operation.
+
+### Client IP, and the way this is usually broken
+
+The caller's address comes from `request.client.host`, which Mangum populates
+from `requestContext.http.sourceIp` — set by AWS from the actual TCP
+connection, and not influenceable by the caller.
+
+**`X-Forwarded-For` is deliberately ignored.** Most rate-limiting guidance says
+to prefer it, because most deployments sit behind a load balancer that sets it.
+Nothing sits in front of this Function URL, so the header arrives exactly as
+the client typed it. Verified directly: a request carrying
+`X-Forwarded-For: 1.2.3.4` still reports its real `sourceIp`, and the header
+passes through untouched. Keying on it would let one attacker present as
+unlimited distinct clients by incrementing a number — worse than no limit,
+because it looks like protection while providing none.
+
+**This must change if anything is ever put in front.** Adding CloudFront makes
+`sourceIp` CloudFront's address, collapsing every user in the world into a
+handful of edge IPs and making the limit global. At that point the correct
+source is the rightmost untrusted entry in `X-Forwarded-For`, or
+`CloudFront-Viewer-Address` — but only once the origin is locked down so the
+Function URL cannot be reached directly, since otherwise an attacker skips the
+proxy and forges the header anyway.
+
+### 429 responses
+
+    HTTP/1.1 429 Too Many Requests
+    Retry-After: 412
+    RateLimit-Limit: 10
+    RateLimit-Remaining: 0
+    RateLimit-Reset: 412
+
+`Retry-After` is RFC 9110 and almost universally understood; the `RateLimit-*`
+fields follow the IETF draft and carry the full quota picture. Both are sent so
+any client that understands either can back off correctly. `RateLimit-Reset` is
+*seconds remaining* rather than a timestamp, because a duration cannot be
+misread by a client whose clock disagrees with ours.
+
+A 429 with no timing information is the thing worth avoiding: it tells a client
+to stop without saying for how long, so well-behaved clients guess and the rest
+hammer.
+
+### Why not account lockout
+
+Locking an account after N failed attempts is a real feature and deliberately
+not built. It is a denial-of-service vector aimed at your own users: anyone who
+knows an email address can lock its owner out by failing at it repeatedly, and
+the attacker needs no credentials to do it. The per-email limit here throttles
+rather than locks — it slows an attacker without giving them a button that
+disables someone else's account, and it expires on its own.
+
+### Resources created by hand (QJ-5 will import these)
+
+| Resource | Identifier |
+| -------- | ---------- |
+| DynamoDB table | `quotejar-rate-limits`, PK `pk` (S), PAY_PER_REQUEST, TTL on `expires_at` |
+| VPC endpoint | `vpce-08940f1ea5dae1a5c` — **Gateway**, DynamoDB, on route table `rtb-08a5b21d76235cd7f` |
+| IAM inline policy | `quotejar-rate-limit-table` on role `quotejar-lambda-role` — `UpdateItem` and `GetItem`, scoped to that one table |
+
+    aws dynamodb create-table --table-name quotejar-rate-limits \
+      --attribute-definitions AttributeName=pk,AttributeType=S \
+      --key-schema AttributeName=pk,KeyType=HASH \
+      --billing-mode PAY_PER_REQUEST
+    aws dynamodb update-time-to-live --table-name quotejar-rate-limits \
+      --time-to-live-specification "Enabled=true,AttributeName=expires_at"
+    aws ec2 create-vpc-endpoint --vpc-id vpc-0a7d500454d8fec5b \
+      --vpc-endpoint-type Gateway \
+      --service-name com.amazonaws.us-east-1.dynamodb \
+      --route-table-ids rtb-08a5b21d76235cd7f
+
+Teardown, in addition to the QJ-3 script:
+
+    aws dynamodb delete-table --table-name quotejar-rate-limits
+    aws ec2 delete-vpc-endpoints --vpc-endpoint-ids vpce-08940f1ea5dae1a5c
+    aws iam delete-role-policy --role-name quotejar-lambda-role \
+      --policy-name quotejar-rate-limit-table
+
+### Testing the real store
+
+The suite uses an in-memory store, so it never reaches AWS and needs no
+credentials — `boto3` is deliberately absent from `requirements-dev.txt` so a
+forgotten fixture cannot silently start writing to a real table. To exercise
+the DynamoDB path by hand:
+
+    pip install boto3 "botocore[crt]"    # crt is needed for `aws login` credentials
+
+Then drive `RateLimiter(DynamoDBStore("quotejar-rate-limits"))` directly.
+
 ## Known gaps
 
 Deliberately not built. Each is a real omission rather than an oversight, and
@@ -861,11 +1076,9 @@ have this excuse and does not leak: both failure modes return byte-identical
 responses, and login runs bcrypt even for unknown addresses so response
 timing cannot distinguish them either.
 
-**Rate limiting.** Nothing throttles `/auth/login`, so online password
-guessing is bounded only by bcrypt's ~230 ms per attempt. That is a real
-speed bump — a few hundred guesses a minute rather than millions — but it is
-a side effect of the hashing cost, not a deliberate control. Registration is
-likewise unthrottled, so the endpoint can be used to create accounts in bulk.
+**~~Rate limiting.~~** Closed in QJ-6. Login and registration are limited per
+IP, repeated login failures are limited per email address, and authenticated
+endpoints are limited per user ID. See [Rate limiting](#rate-limiting).
 
 **OAuth / social login.** No third-party identity providers. Worth being
 precise here, because the code uses `OAuth2PasswordRequestForm` and that

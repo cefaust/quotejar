@@ -111,6 +111,62 @@ class Settings(BaseSettings):
     # the access token has to stay short on its own.
     access_token_expire_minutes: int = 30
 
+    # --- Rate limiting ----------------------------------------------------
+    #
+    # Every limit below is expressed as (count, window seconds) so the pairing
+    # stays visible: "10" means nothing without the window it applies to.
+    #
+    # Configurable rather than hardcoded because the right value is discovered
+    # from real traffic, and the alternative to a setting is a redeploy every
+    # time a legitimate user is caught.
+    rate_limit_enabled: bool = True
+    rate_limit_table: str = "quotejar-rate-limits"
+
+    # Login and register, keyed by client IP.
+    #
+    # Ten attempts per fifteen minutes. A human logging in touches this two or
+    # three times even having forgotten a password; ten leaves room for a
+    # retrying mobile client without leaving room for a script.
+    #
+    # The number is chosen against the *cost*, not against intuition. Each
+    # attempt spends ~216 ms of a reserved execution slot, so ten per fifteen
+    # minutes caps one IP at about 2.2 seconds of CPU per window. Five
+    # attackers -- enough to saturate reserved concurrency of 5 without a
+    # limiter -- now cost 11 seconds of CPU per quarter hour between them.
+    auth_ip_limit: int = 10
+    auth_ip_window_seconds: int = 900
+
+    # Failed logins, keyed by the email being attempted.
+    #
+    # Stricter, and deliberately a different axis. The IP limit protects the
+    # *service* from resource exhaustion; this protects an *account* from
+    # credential stuffing. They fail in opposite directions: an attacker with a
+    # botnet defeats the IP limit while every attempt still lands on one email,
+    # and conversely a shared NAT -- an office, a university, a mobile carrier
+    # -- puts thousands of innocent users behind one address where a per-IP
+    # limit punishes all of them for one. Neither limit substitutes for the
+    # other.
+    #
+    # Counts failures only. See app/ratelimit.py: counting successes would
+    # penalise the account's real owner, and would let an attacker lock someone
+    # out by deliberately failing at their address.
+    auth_email_limit: int = 5
+    auth_email_window_seconds: int = 900
+
+    # Authenticated endpoints, keyed by user ID.
+    #
+    # Keyed on identity rather than address because after authentication we
+    # have something better than an IP. A user ID survives a phone moving
+    # between wifi and cellular, cannot be changed by rotating addresses, and
+    # is unaffected by NAT. IP is what you use when you do not yet know who is
+    # calling; once you do, using it anyway is throwing information away.
+    #
+    # Generous at two requests per second sustained: this bounds a runaway
+    # client or a stolen token, and no human capturing their kids' quotes will
+    # ever reach it.
+    authenticated_limit: int = 120
+    authenticated_window_seconds: int = 60
+
     # --- Connection pooling -----------------------------------------------
     #
     # Sized against the database, not against the application. See app/db.py
