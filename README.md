@@ -961,6 +961,45 @@ that it has been open for a month. There is a test asserting the API returns
 200 rather than 500 when the store is down — the single most important test in
 the suite, because that behaviour is invisible in normal operation.
 
+### Known limit: throttling is not distinguished from unavailability
+
+`RateLimiter` catches a bare `Exception` around every store call and fails open
+on all of them. That deliberately covers a partition, expired credentials, a
+deleted table, a missing SDK — failures where proceeding is right.
+
+**It also covers a `ThrottlingException`, and that one is different in kind.**
+A throttling response is not DynamoDB being broken; it is DynamoDB working
+correctly and telling us to slow down. The failure mode is self-reinforcing:
+the attack this exists to stop is high request volume, high request volume
+means high DynamoDB volume, and if that trips throttling then the limiter
+disables itself at precisely the moment it is needed. Every throttled check
+returns "allowed", so the counters stop advancing and the load that caused the
+throttling is the load that is now unmetered.
+
+**Why it is not reachable today.** Each limited request costs one `ADD` write
+and two strongly-consistent reads — 1 WCU and 2 RCU. A rejected request skips
+bcrypt and costs about three DynamoDB round trips, call it 20 ms, so reserved
+concurrency of 5 tops the whole function out near 250 requests/second. All the
+counters for one key in one window are a single item, so that is ~250 WCU/s
+against one partition key, against an on-demand ceiling of 1,000 WCU/s and
+3,000 RCU/s per partition key. Roughly 4x of headroom.
+
+**4x is a margin, not a guarantee, and it is a margin that the concurrency cap
+is holding up.** Raising reserved concurrency — or QJ-5's move to Fargate,
+where nothing caps concurrency at 5 — spends that headroom directly. The two
+limits are coupled: the bottleneck in the section below is the only reason this
+one is theoretical.
+
+**The fix when it matters** is to catch `ThrottlingException`,
+`ProvisionedThroughputExceededException`, and `RequestLimitExceeded` separately
+from the rest and fail *closed* on them — reject with 429 — while continuing to
+fail open on genuine unavailability. Throttling means the store is up and
+declining the write, so a 429 is the honest answer, and it is the one case
+where the "protects capacity, so fail open" rule inverts: the capacity being
+protected is what ran out. Not done here because it cannot currently trigger
+and an untriggerable branch is an untested branch. It should be done as part of
+QJ-5, in the same change that removes the concurrency cap.
+
 ### Client IP, and the way this is usually broken
 
 The caller's address comes from `request.client.host`, which Mangum populates

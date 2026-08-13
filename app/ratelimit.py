@@ -255,11 +255,26 @@ class RateLimiter:
     def _fail_open(self, scope: str, limit: int, window_seconds: int) -> Decision:
         """Allow the request when the store is unreachable.
 
-        Deliberately broad exception handling upstream. Any failure to reach
-        the store -- throttling, a partition, expired credentials, a missing
-        table -- has the same correct response, and enumerating boto3's
+        Deliberately broad exception handling upstream: a partition, expired
+        credentials, a missing table, a missing SDK. Enumerating boto3's
         exception hierarchy would mean a new failure mode raising a 500 instead
         of failing open.
+
+        **Throttling is caught here too, and it does not belong with the
+        others.** A ThrottlingException is not the store being unreachable; it
+        is the store working correctly and asking us to slow down. Failing open
+        on it is self-reinforcing -- the volume that trips throttling is the
+        volume that then goes unmetered, so the limiter switches itself off
+        under exactly the load it exists to bound.
+
+        It is left this way because at reserved concurrency 5 the function tops
+        out around 250 requests/second, roughly 4x below DynamoDB's
+        per-partition-key write ceiling, so this branch cannot currently be
+        reached -- and an untriggerable branch is an untested branch. That
+        margin is held up entirely by the concurrency cap. When the cap goes
+        (QJ-5), throttling should be caught separately and failed *closed*.
+        README.md, "Known limit: throttling is not distinguished from
+        unavailability", has the reasoning and the exception names.
 
         The full reasoning is in README.md. In short: a rate limiter is a
         control on abuse, not a dependency of the product, and letting it take
