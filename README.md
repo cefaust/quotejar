@@ -844,6 +844,12 @@ us 216 ms of a reserved execution slot. With reserved concurrency of 5, five
 concurrent attackers saturate the function and every real user is throttled.
 No password has to be guessed for the service to go down.
 
+What follows raises the cost of that attack by about three orders of magnitude.
+It does not eliminate it — reserved concurrency of 5 remains the binding
+constraint, and a distributed caller staying inside every published limit can
+still saturate the function. See [What this does not
+solve](#what-this-does-not-solve-reserved-concurrency-is-still-the-bottleneck).
+
 ### The limits
 
 | Scope | Keyed on | Limit | Window |
@@ -1049,6 +1055,53 @@ knows an email address can lock its owner out by failing at it repeatedly, and
 the attacker needs no credentials to do it. The per-email limit here throttles
 rather than locks — it slows an attacker without giving them a button that
 disables someone else's account, and it expires on its own.
+
+### What this does not solve: reserved concurrency is still the bottleneck
+
+The section at the top of this chapter says five concurrent attackers can
+saturate the function. Rate limiting does not close that hole. It raises the
+price of it, and the honest framing is a cost multiplier rather than a fix.
+
+The arithmetic. Saturating 5 execution slots for a full 15-minute window at
+216 ms per bcrypt call takes 5 × 900 / 0.216 ≈ **20,800 requests**. At 10 per
+IP per window, that is about **2,080 distinct source addresses** — and every
+one of them stays comfortably inside the limit the whole time. No limit is ever
+tripped, no 429 is ever returned, and the service is fully saturated.
+
+Two thousand addresses is not an exotic requirement. It is a small botnet, one
+mid-sized cloud account, or a residential IPv6 /64 — which, as noted above,
+hands one attacker 18 quintillion addresses to rotate through.
+
+**The cheapest path is `/auth/register`, not `/auth/login`.** Registration
+hashes the new password, so it costs the same 216 ms, but only the per-IP limit
+applies to it — the per-email limit counts *failed logins* and never sees a
+registration. An attacker submitting fresh addresses pays the IP limit and
+nothing else. Login is marginally worse for them: an attacker hammering one
+address hits the 5-failure email limit, so spreading across ~4,200 target
+emails is required to match, which is more bookkeeping for the same effect.
+
+**What the limiter actually bought.** Before QJ-6, saturation took 5 concurrent
+attackers from a single machine. After, it takes ~2,080 coordinated addresses.
+That is roughly three orders of magnitude, which moves the attack from
+"anybody with a laptop and a for-loop" to "somebody who wants this specifically"
+— genuinely worth having, and genuinely not the same as closed.
+
+**What would actually close it**, none of which is in this ticket's scope:
+
+- **Raise or remove reserved concurrency.** The cap is a *cost* control, not a
+  security one — it exists so a runaway bill is impossible, and the account
+  limit is now 1,000 after the quota increase in QJ-3. Removing it trades a
+  service-availability DoS for a billing DoS. That is a real trade with a real
+  answer, not an obvious win.
+- **Get bcrypt off the request path for unauthenticated volume**, e.g. a proof
+  of work or a CAPTCHA ahead of registration. This attacks the actual root
+  cause, which is that an anonymous caller can spend 216 ms of our CPU for the
+  cost of one HTTP request.
+- **CloudFront + AWS WAF** for volumetric and reputation-based blocking at the
+  edge, before a request ever reaches Lambda. Ruled out as the *store* for this
+  ticket (see the table above — it cannot key on user ID, so it cannot satisfy
+  the per-user limit), but it is the right tool for exactly this problem and
+  would sit in front of, not instead of, what is built here.
 
 ### Resources created by hand (QJ-5 will import these)
 
