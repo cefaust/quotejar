@@ -39,7 +39,7 @@ resource "aws_security_group" "vpc_endpoint" {
     ipv6_cidr_blocks = []
     prefix_list_ids  = []
     protocol         = "tcp"
-    security_groups  = ["sg-0c47444c43f3ed25f"]
+    security_groups  = [aws_security_group.lambda.id]
     self             = false
     to_port          = 443
   }]
@@ -70,7 +70,7 @@ resource "aws_security_group" "rds" {
     ipv6_cidr_blocks = []
     prefix_list_ids  = []
     protocol         = "tcp"
-    security_groups  = ["sg-0c47444c43f3ed25f"]
+    security_groups  = [aws_security_group.lambda.id]
     self             = false
     to_port          = 5432
   }]
@@ -146,11 +146,11 @@ resource "aws_vpc_endpoint" "secretsmanager" {
   private_dns_enabled        = true
   resource_configuration_arn = null
   route_table_ids            = []
-  security_group_ids         = ["sg-04efb90f045da68c7"]
+  security_group_ids         = [aws_security_group.vpc_endpoint.id]
   service_name               = "com.amazonaws.us-east-1.secretsmanager"
   service_network_arn        = null
   service_region             = data.aws_region.current.region
-  subnet_ids                 = ["subnet-05ea50db0fd8c9ab0"]
+  subnet_ids                 = [var.private_subnet_id]
   tags                       = {}
   tags_all                   = {}
   vpc_endpoint_type          = "Interface"
@@ -162,6 +162,6 @@ resource "aws_vpc_endpoint" "secretsmanager" {
   subnet_configuration {
     ipv4      = "172.31.92.57"
     ipv6      = null
-    subnet_id = "subnet-05ea50db0fd8c9ab0"
+    subnet_id = var.private_subnet_id
   }
 }

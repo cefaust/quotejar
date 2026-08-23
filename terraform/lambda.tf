@@ -58,8 +58,8 @@ resource "aws_lambda_function" "api" {
   }
   vpc_config {
     ipv6_allowed_for_dual_stack = false
-    security_group_ids          = ["sg-0c47444c43f3ed25f"]
-    subnet_ids                  = ["subnet-05ea50db0fd8c9ab0"]
+    security_group_ids          = [aws_security_group.lambda.id]
+    subnet_ids                  = [var.private_subnet_id]
   }
 
   # CD, not Terraform, owns which image is deployed.

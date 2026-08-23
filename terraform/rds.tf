@@ -4,8 +4,23 @@
 # diff here before applying. `identifier`, `engine`, and subnet group changes
 # force replacement, and replacement of a database means an empty one.
 #
-# skip_final_snapshot is false: a destroy must leave a snapshot behind. That
-# is the difference between a recoverable mistake and a permanent one.
+# **skip_final_snapshot is true, and that is dangerous under Terraform.**
+#
+# It was set that way in QJ-3 for a good reason: a retained snapshot keeps
+# billing for storage after the instance is gone, which is exactly the
+# forgotten charge the teardown runbook exists to prevent. When teardown was a
+# deliberate CLI command typed once, that trade was fine.
+#
+# It is a worse trade now. `terraform destroy` needs no confirmation beyond
+# -auto-approve, and a mistargeted destroy -- or a `forces replacement` line
+# scrolled past in a plan -- deletes this database with **no snapshot and no
+# recovery**. The setting has not been changed, because flipping it would put
+# a real cost back on every teardown; the guard below is the answer instead.
+#
+# prevent_destroy makes Terraform refuse to destroy this resource at all. It
+# is a configuration-only meta-argument -- nothing in AWS changes and it
+# creates no diff -- and removing it is a deliberate edit somebody has to
+# make, which is precisely the pause that matters here.
 #
 # The master password is not in this configuration and cannot be -- it is in
 # state regardless, which is the leak documented in secrets.tf.
@@ -67,5 +82,12 @@ resource "aws_db_instance" "main" {
   tags_all                              = {}
   upgrade_storage_config                = null
   username                              = "quotejar"
-  vpc_security_group_ids                = ["sg-0956a5f7b9950e1b2"]
+  vpc_security_group_ids                = [aws_security_group.rds.id]
+
+  lifecycle {
+    # Refuses `terraform destroy` on this resource. See the note above:
+    # skip_final_snapshot is true, so a destroy here leaves no snapshot and
+    # no way back. Removing this guard has to be a deliberate edit.
+    prevent_destroy = true
+  }
 }

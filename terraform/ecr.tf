@@ -1,7 +1,10 @@
 # Container registry for the Lambda image.
 #
-# force_delete is false, so `terraform destroy` refuses while images remain
-# rather than silently deleting the artefact every past deploy points at.
+# force_delete is unset, which defaults to false, so `terraform destroy`
+# refuses while images remain rather than silently deleting the artefact every
+# past deploy points at. Left unset rather than written as `false` so the
+# config keeps matching the live resource exactly -- the point of the clean
+# plan is that nothing here is aspirational.
 
 resource "aws_ecr_repository" "app" {
   force_delete         = null

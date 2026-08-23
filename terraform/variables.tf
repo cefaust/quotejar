@@ -95,3 +95,16 @@ variable "db_allocated_storage_gb" {
   type        = number
   default     = 20
 }
+
+variable "private_subnet_id" {
+  description = <<-EOT
+    Subnet the Lambda ENIs and the Secrets Manager interface endpoint live in.
+
+    A literal rather than a resource reference because it belongs to the
+    default VPC, which is deliberately unmanaged -- there is no
+    aws_subnet resource to point at. Kept as a variable so the ID appears
+    once instead of three times.
+  EOT
+  type        = string
+  default     = "subnet-05ea50db0fd8c9ab0"
+}

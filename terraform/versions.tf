@@ -31,6 +31,17 @@ terraform {
   #
   # S3 fixes the first three. Versioning on the bucket makes a corrupted or
   # truncated write recoverable rather than fatal.
+  # The two literals below are the only hardcoded account/region values left in
+  # this configuration, and they cannot be anything else: **a backend block
+  # accepts no variables, locals, or interpolation of any kind.** Terraform
+  # has to locate its state before it can evaluate a variable, so the values
+  # that tell it where state lives cannot themselves come from state-dependent
+  # evaluation. Everything else derives its account and region from data
+  # sources.
+  #
+  # The alternative is `-backend-config=` on init, which moves the values to a
+  # file or a flag rather than removing them. Not worth it for a single
+  # environment.
   backend "s3" {
     bucket = "quotejar-tfstate-782747473074"
     key    = "quotejar/terraform.tfstate"
