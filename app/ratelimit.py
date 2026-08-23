@@ -208,12 +208,45 @@ class RateLimiter:
             self._increment(scope, identifier, window_seconds)
         except Exception:
             return self._fail_open(scope, limit, window_seconds)
-        return self.peek(scope, identifier, limit, window_seconds)
+        # pending=0: the increment above already put this request in the count,
+        # so the stored total is the answer to "how many including this one".
+        return self._decide(scope, identifier, limit, window_seconds, pending=0)
 
     def peek(
         self, scope: str, identifier: str, limit: int, window_seconds: int
     ) -> Decision:
         """Decide without counting. Used before an attempt that may not count."""
+        # pending=1: nothing has been incremented, so the stored total covers
+        # only *previous* attempts. The attempt being authorised right now has
+        # to be added in, or it is decided against a count it is missing from.
+        return self._decide(scope, identifier, limit, window_seconds, pending=1)
+
+    def _decide(
+        self,
+        scope: str,
+        identifier: str,
+        limit: int,
+        window_seconds: int,
+        pending: int,
+    ) -> Decision:
+        """Weigh the stored counters and answer allow/deny.
+
+        `pending` is the load-bearing argument, and getting it wrong is an
+        off-by-one that silently loosens a security control by one attempt.
+
+        Both callers ask the same question -- "if this request proceeds, does
+        the total stay within the limit?" -- but they ask it at different
+        points. `check` has already incremented, so the request is in the
+        stored count and `pending` is 0. `peek` runs before anything is
+        recorded, so the request it is authorising is *not* in the stored
+        count and must be added, hence 1.
+
+        Sharing one comparison with an explicit `pending` is what keeps the two
+        aligned. The original bug was `check` delegating to `peek` and
+        inheriting a comparison written for the counted case: standalone
+        `peek` then allowed `limit + 1` attempts, so `auth_email_limit = 5`
+        actually permitted six failed logins before throttling.
+        """
         now = time.time()
         current_start = int(now // window_seconds) * window_seconds
         previous_start = current_start - window_seconds
@@ -225,7 +258,7 @@ class RateLimiter:
         except Exception:
             return self._fail_open(scope, limit, window_seconds)
 
-        estimate = previous * (1 - elapsed_fraction) + current
+        estimate = previous * (1 - elapsed_fraction) + current + pending
         return Decision(
             allowed=estimate <= limit,
             limit=limit,

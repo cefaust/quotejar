@@ -148,6 +148,57 @@ def test_a_decision_reports_the_remaining_quota():
     assert 0 < first.reset_seconds <= 60
 
 
+# --- the limit means what it says ------------------------------------------
+
+
+def test_peek_allows_exactly_the_limit_and_not_one_more():
+    """Regression: peek() used to permit limit + 1.
+
+    peek() decides *before* the attempt it is authorising has been recorded,
+    so that attempt is not yet in the stored count and has to be added in.
+    Without it the comparison runs against a total the request is missing
+    from, and every peek-guarded limit sits one attempt looser than its
+    configured value -- auth_email_limit = 5 allowed six failed logins.
+
+    The failure is invisible from the outside: throttling still happens, just
+    one attempt late, so nothing looks broken. Only counting catches it.
+    """
+    rl = RateLimiter(MemoryStore())
+
+    permitted = 0
+    while rl.peek("scope", "id", limit=5, window_seconds=60).allowed:
+        rl.record("scope", "id", 60)
+        permitted += 1
+        if permitted > 20:  # never spin if the boundary regresses open
+            break
+
+    assert permitted == 5
+
+
+def test_check_and_peek_agree_on_what_a_limit_permits():
+    """The two paths must not disagree about what `limit` means.
+
+    They count at different moments -- check() increments then decides,
+    peek() decides then the caller may record -- and that difference is
+    exactly where the off-by-one lived. Whatever the number, both must let the
+    same quota through.
+    """
+    for limit in (1, 3, 5, 10):
+        counted = RateLimiter(MemoryStore())
+        via_check = 0
+        while counted.check("scope", "id", limit, 60).allowed and via_check <= 20:
+            via_check += 1
+
+        deferred = RateLimiter(MemoryStore())
+        via_peek = 0
+        while deferred.peek("scope", "id", limit, 60).allowed and via_peek <= 20:
+            deferred.record("scope", "id", 60)
+            via_peek += 1
+
+        assert via_check == limit, f"check allowed {via_check} against limit {limit}"
+        assert via_peek == limit, f"peek allowed {via_peek} against limit {limit}"
+
+
 # --- fail open -------------------------------------------------------------
 
 
@@ -235,18 +286,49 @@ def test_a_429_carries_retry_after_and_ratelimit_headers(memory_limiter, anon_cl
 
 def test_repeated_failures_against_one_email_are_limited(memory_limiter, anon_client):
     """The second axis. A botnet defeats the per-IP limit while every attempt
-    still lands on one address."""
+    still lands on one address.
+
+    Asserts the exact boundary rather than overshooting it. An earlier version
+    of this test made limit + 1 failures before checking for a 429, which
+    passes whether the limit is honoured at five attempts or at six -- and it
+    was six. A rate limit test that does not pin the count cannot tell a
+    working limit from one that is off by one.
+    """
     email = _email()
     anon_client.post("/auth/register", json={"email": email, "password": PASSWORD})
 
-    for _ in range(settings.auth_email_limit + 1):
-        anon_client.post("/auth/login", data={"username": email, "password": "wrong"})
+    for attempt in range(settings.auth_email_limit):
+        response = anon_client.post(
+            "/auth/login", data={"username": email, "password": "wrong"}
+        )
+        assert response.status_code == 401, f"attempt {attempt + 1} was throttled early"
 
-    # Even with the correct password, the account is now throttled.
+    # The next one is refused, and the correct password does not buy a way out
+    # -- the limit is on the address being attempted, not on the credential.
     response = anon_client.post(
         "/auth/login", data={"username": email, "password": PASSWORD}
     )
     assert response.status_code == 429
+
+
+def test_the_last_attempt_inside_the_email_limit_still_works(
+    memory_limiter, anon_client
+):
+    """The other direction: the limit must not be one attempt too strict.
+
+    Fixing an off-by-one that ran loose is an easy way to introduce one that
+    runs tight, which would lock a legitimate user out a whole attempt early.
+    """
+    email = _email()
+    anon_client.post("/auth/register", json={"email": email, "password": PASSWORD})
+
+    for _ in range(settings.auth_email_limit - 1):
+        anon_client.post("/auth/login", data={"username": email, "password": "wrong"})
+
+    response = anon_client.post(
+        "/auth/login", data={"username": email, "password": PASSWORD}
+    )
+    assert response.status_code == 200
 
 
 def test_successful_logins_do_not_count_against_the_email_limit(
