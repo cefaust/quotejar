@@ -833,6 +833,368 @@ image of this size. Nobody notices at this traffic level, and it is the
 explicit tradeoff for paying nothing while idle. Provisioned concurrency
 removes it and reintroduces a constant bill.
 
+## Rate limiting
+
+### The problem it solves
+
+bcrypt costs ~216 ms of CPU per verification, deliberately — that slowness is
+what protects hashes against offline cracking. Pointed at a live endpoint the
+property inverts: an attempt costs an attacker one cheap HTTP request and costs
+us 216 ms of a reserved execution slot. With reserved concurrency of 5, five
+concurrent attackers saturate the function and every real user is throttled.
+No password has to be guessed for the service to go down.
+
+What follows raises the cost of that attack by about three orders of magnitude.
+It does not eliminate it — reserved concurrency of 5 remains the binding
+constraint, and a distributed caller staying inside every published limit can
+still saturate the function. See [What this does not
+solve](#what-this-does-not-solve-reserved-concurrency-is-still-the-bottleneck).
+
+### The limits
+
+| Scope | Keyed on | Limit | Window |
+| ----- | -------- | ----- | ------ |
+| `/auth/login`, `/auth/register` | client IP | 10 | 15 min |
+| failed logins | email address | 5 | 15 min |
+| authenticated endpoints | user ID | 120 | 1 min |
+
+**Why the first two are different limits rather than one.** They protect
+different things and each is blind exactly where the other sees. The IP limit
+protects the *service* from resource exhaustion; the email limit protects an
+*account* from credential stuffing. An attacker with a botnet defeats the IP
+limit while every attempt still lands on one address. Conversely a shared NAT —
+an office, a university, a mobile carrier — puts thousands of innocent users
+behind one address, where a per-IP limit punishes all of them for one. Neither
+substitutes for the other.
+
+**Why the third is keyed on user ID.** After authentication there is something
+better than an address available. A user ID survives a phone moving between
+wifi and cellular, cannot be changed by rotating IPs, and is unaffected by NAT.
+IP is what you use when you do not yet know who is calling; once you do, using
+it anyway throws information away.
+
+**Why the email limit counts failures only.** A user who types their password
+correctly has not attacked anything. Counting successes would penalise the
+account's real owner for using their own account, and would hand an attacker a
+way to throttle someone by deliberately failing at their address.
+
+### Why IP is a weak key at all
+
+Worth being honest that per-IP limiting is the least reliable of the three.
+Carrier-grade NAT puts entire mobile networks behind a handful of addresses, so
+one limit covers thousands of unrelated people. IPv6 privacy extensions rotate
+a client's address regularly, and a residential /64 gives one attacker
+18 quintillion addresses to cycle through. Cloud egress is rentable by the
+hour.
+
+It is used before authentication because there is nothing better — the caller
+has not yet told us who they are. Everything after that point is keyed on
+identity, which is the actual answer to "what would you key on instead".
+
+### Store: DynamoDB, and why not the alternatives
+
+In-process counters cannot work here. Lambda gives up to five execution
+environments, each with its own memory, created and destroyed unpredictably, so
+a per-process counter would grant 5x the intended limit and reset on every cold
+start. The counter has to be shared.
+
+| | Monthly | Why not chosen |
+| --- | --- | --- |
+| **DynamoDB** (chosen) | **~$0** | — |
+| ElastiCache Redis | ~$9–12 | An always-on node for hobby traffic, plus something else to patch, monitor, and remember to tear down. `INCR`/`EXPIRE` is genuinely simpler than conditional writes, and sub-millisecond — it is the better tool, at a standing cost this project cannot justify. |
+| CloudFront + AWS WAF | ~$6+ | **WAF cannot attach to a Lambda Function URL** — the supported targets are CloudFront, API Gateway, ALB, AppSync, Cognito, App Runner, Amplify, and Verified Access. It would mean adding CloudFront as a fronting origin. More decisively, WAF does not decode JWTs, so it cannot key on user ID and cannot satisfy the per-user limit at all — it would be an *additional* layer on top of one of the others, not an alternative. It would also require locking the Function URL to `AWS_IAM` behind Origin Access Control, since otherwise an attacker simply bypasses CloudFront and hits Lambda directly. |
+
+DynamoDB's decisive advantage here is specific to this architecture: the Lambda
+has no route to the internet, so any store must be reachable privately, and
+DynamoDB offers a **Gateway** VPC endpoint, which is free. Compare the Secrets
+Manager *Interface* endpoint at roughly $7/month. Pay-per-request pricing at
+this traffic rounds to nothing, TTL reclaims old counters automatically, and
+there is no instance to operate or tear down.
+
+The honest cost of the choice: conditional-write logic is more code than
+`INCR`, and single-digit-millisecond latency is slower than Redis. Neither
+matters next to a 216 ms bcrypt call.
+
+### Algorithm: sliding window counter
+
+**Fixed window** — one counter per calendar window — is simplest and has a
+specific flaw: an attacker gets *twice* the limit across a boundary. With 10
+per minute they send 10 at 11:59:59 and 10 more at 12:00:00. Both windows are
+individually legal; 20 requests land in two seconds. For a limiter whose job is
+bounding a 216 ms operation, a 2x burst is the difference between bounded and
+unbounded.
+
+**Sliding window log** stores every request timestamp and is exact, but a limit
+of N costs N stored timestamps per key — unbounded write amplification under
+exactly the attack this exists to stop.
+
+**Token bucket** handles bursts gracefully but needs two mutable fields
+updated atomically, which is a read-modify-write rather than a single atomic
+`ADD`.
+
+**Sliding window counter** keeps a counter for the current window and the
+previous one, weighting the previous by how much still overlaps:
+
+    estimate = previous_count × (1 − elapsed_fraction) + current_count
+
+Two small items per key and one atomic increment. There is a test that fires
+across a window boundary and asserts the second burst is rejected.
+
+**What the approximation costs.** The weighting assumes the previous window's
+traffic was spread evenly. Real traffic is bursty, so wherever it was skewed
+the estimate is wrong — and it errs in *both* directions, not only the safe
+one. Measured against an exact sliding log at a limit of 10 per 900s:
+
+| Traffic shape | Exact log | This limiter | Effect |
+| --- | --- | --- | --- |
+| 10 requests in the first 10s of a window, then idle; checked at t=910 | 0 in the trailing window → allow | credits ~98.9% of them → **deny** | a user who bursted is throttled after 15 idle minutes |
+| 10 at the end of one window, then again at the end of the next; checked at t=1789 | caps at 10 → deny | previous window 98.8% elapsed, contributes ~0.12 → **9 more allowed** | **19 in one trailing 900s window against a limit of 10** |
+
+So the sliding counter does not *eliminate* the fixed window's 2× boundary
+burst — it reshapes it. A fixed window lets 20 requests land in **one second**;
+this caps concentration at 10 per ~10 seconds with the two clusters 15 minutes
+apart. The sustained-rate error is comparable; the *instantaneous* burst is far
+better. Since what is being defended is CPU saturation, concentration is the
+number that matters, which is why the trade is still the right one — but "no
+boundary burst" would be an overstatement.
+
+### Fail open, deliberately
+
+If DynamoDB is unreachable, requests **proceed** and the failure is logged at
+ERROR with a traceback.
+
+The reasoning: a rate limiter is a control on abuse, not a dependency of the
+product. Failing closed would mean a DynamoDB outage takes QuoteJar down
+entirely — converting a partial degradation into a total one, and adding a new
+single point of failure in the name of security. The blast radius of the wrong
+choice is asymmetric: failing open during an outage means a window with no
+limiting, while failing closed means a window with no service.
+
+**The opposite choice is defensible and would be right elsewhere.** If this
+guarded something whose abuse is worse than its unavailability — payment
+authorisation, a password reset flow, anything where an unlimited attempt rate
+is catastrophic — fail closed. The rule of thumb: fail open when the limiter
+protects *capacity*, fail closed when it protects *correctness or money*. Here
+it protects capacity.
+
+What makes fail-open survivable is that the gap is loud. It logs at ERROR with
+a traceback on every failed call, because a fail-open limiter that logs quietly
+is indistinguishable from one that works, and you discover during an incident
+that it has been open for a month. There is a test asserting the API returns
+200 rather than 500 when the store is down — the single most important test in
+the suite, because that behaviour is invisible in normal operation.
+
+### A refused request is never counted
+
+`check` reads and decides *first*, and increments only when it admits the
+request. The obvious alternative — increment, then decide — is wrong in a way
+that takes a while to surface.
+
+Counting a refusal lets a caller inflate the counter its own future decisions
+are built from. A client that retries after a 429 pushes its own quota further
+away, producing another 429, producing another retry. Measured at 10 per 15
+minutes:
+
+| Client | Writes | Peak counter | Quota returns |
+| --- | --- | --- | --- |
+| Honours `Retry-After` | 11 | 10 | **890s**, as documented |
+| Retries 1/s, counting refusals | 5,410 | 900 | **never** (tested to 5,400s) |
+| Retries 1/s, current behaviour | 11 | 10 | **890s** |
+
+"Ten per fifteen minutes" silently became an indefinite lockout, and the client
+that behaves this way is usually not an attacker — it is a mobile app with a
+naive retry loop, whose user has no way to discover why they are shut out for
+hours. Clamping the previous window does *not* fix this: a hammering client
+inflates the current window too, so refusing to count is the only fix.
+
+It also stops a rejected request costing a write. At 1 write + 2 strongly
+consistent reads, the limiter costs roughly **3× the Lambda invocation it is
+protecting** per refused request, so this removes about a third of the
+DynamoDB spend under sustained abuse — and, more usefully, removes the writes
+that would otherwise drive the write rate toward the throttling ceiling in the
+next section.
+
+**The cost of this ordering** is that the read and the increment are no longer
+one atomic operation, so two concurrent invocations can both admit against the
+same count. Overshoot is bounded by concurrent executions — **4 at reserved
+concurrency 5** — which is noise for a limiter bounding CPU. It stops being
+noise if concurrency rises; the fix then is a conditional write
+(`ConditionExpression: #c < :limit`), which restores atomicity and still
+refuses to count what it rejects. Another item coupled to QJ-5.
+
+### Known limit: throttling is not distinguished from unavailability
+
+`RateLimiter` catches a bare `Exception` around every store call and fails open
+on all of them. That deliberately covers a partition, expired credentials, a
+deleted table, a missing SDK — failures where proceeding is right.
+
+**It also covers a `ThrottlingException`, and that one is different in kind.**
+A throttling response is not DynamoDB being broken; it is DynamoDB working
+correctly and telling us to slow down. The failure mode is self-reinforcing:
+the attack this exists to stop is high request volume, high request volume
+means high DynamoDB volume, and if that trips throttling then the limiter
+disables itself at precisely the moment it is needed. Every throttled check
+returns "allowed", so the counters stop advancing and the load that caused the
+throttling is the load that is now unmetered.
+
+**Why it is not reachable today.** Each limited request costs one `ADD` write
+and two strongly-consistent reads — 1 WCU and 2 RCU. A rejected request skips
+bcrypt and costs about three DynamoDB round trips, call it 20 ms, so reserved
+concurrency of 5 tops the whole function out near 250 requests/second. All the
+counters for one key in one window are a single item, so that is ~250 WCU/s
+against one partition key, against an on-demand ceiling of 1,000 WCU/s and
+3,000 RCU/s per partition key. Roughly 4x of headroom.
+
+**4x is a margin, not a guarantee, and it is a margin that the concurrency cap
+is holding up.** Raising reserved concurrency — or QJ-5's move to Fargate,
+where nothing caps concurrency at 5 — spends that headroom directly. The two
+limits are coupled: the bottleneck in the section below is the only reason this
+one is theoretical.
+
+**The fix when it matters** is to catch `ThrottlingException`,
+`ProvisionedThroughputExceededException`, and `RequestLimitExceeded` separately
+from the rest and fail *closed* on them — reject with 429 — while continuing to
+fail open on genuine unavailability. Throttling means the store is up and
+declining the write, so a 429 is the honest answer, and it is the one case
+where the "protects capacity, so fail open" rule inverts: the capacity being
+protected is what ran out. Not done here because it cannot currently trigger
+and an untriggerable branch is an untested branch. It should be done as part of
+QJ-5, in the same change that removes the concurrency cap.
+
+### Client IP, and the way this is usually broken
+
+The caller's address comes from `request.client.host`, which Mangum populates
+from `requestContext.http.sourceIp` — set by AWS from the actual TCP
+connection, and not influenceable by the caller.
+
+**`X-Forwarded-For` is deliberately ignored.** Most rate-limiting guidance says
+to prefer it, because most deployments sit behind a load balancer that sets it.
+Nothing sits in front of this Function URL, so the header arrives exactly as
+the client typed it. Verified directly: a request carrying
+`X-Forwarded-For: 1.2.3.4` still reports its real `sourceIp`, and the header
+passes through untouched. Keying on it would let one attacker present as
+unlimited distinct clients by incrementing a number — worse than no limit,
+because it looks like protection while providing none.
+
+**This must change if anything is ever put in front.** Adding CloudFront makes
+`sourceIp` CloudFront's address, collapsing every user in the world into a
+handful of edge IPs and making the limit global. At that point the correct
+source is the rightmost untrusted entry in `X-Forwarded-For`, or
+`CloudFront-Viewer-Address` — but only once the origin is locked down so the
+Function URL cannot be reached directly, since otherwise an attacker skips the
+proxy and forges the header anyway.
+
+### 429 responses
+
+    HTTP/1.1 429 Too Many Requests
+    Retry-After: 412
+    RateLimit-Limit: 10
+    RateLimit-Remaining: 0
+    RateLimit-Reset: 412
+
+`Retry-After` is RFC 9110 and almost universally understood; the `RateLimit-*`
+fields follow the IETF draft and carry the full quota picture. Both are sent so
+any client that understands either can back off correctly. `RateLimit-Reset` is
+*seconds remaining* rather than a timestamp, because a duration cannot be
+misread by a client whose clock disagrees with ours.
+
+A 429 with no timing information is the thing worth avoiding: it tells a client
+to stop without saying for how long, so well-behaved clients guess and the rest
+hammer.
+
+### Why not account lockout
+
+Locking an account after N failed attempts is a real feature and deliberately
+not built. It is a denial-of-service vector aimed at your own users: anyone who
+knows an email address can lock its owner out by failing at it repeatedly, and
+the attacker needs no credentials to do it. The per-email limit here throttles
+rather than locks — it slows an attacker without giving them a button that
+disables someone else's account, and it expires on its own.
+
+### What this does not solve: reserved concurrency is still the bottleneck
+
+The section at the top of this chapter says five concurrent attackers can
+saturate the function. Rate limiting does not close that hole. It raises the
+price of it, and the honest framing is a cost multiplier rather than a fix.
+
+The arithmetic. Saturating 5 execution slots for a full 15-minute window at
+216 ms per bcrypt call takes 5 × 900 / 0.216 ≈ **20,800 requests**. At 10 per
+IP per window, that is about **2,080 distinct source addresses** — and every
+one of them stays comfortably inside the limit the whole time. No limit is ever
+tripped, no 429 is ever returned, and the service is fully saturated.
+
+Two thousand addresses is not an exotic requirement. It is a small botnet, one
+mid-sized cloud account, or a residential IPv6 /64 — which, as noted above,
+hands one attacker 18 quintillion addresses to rotate through.
+
+**The cheapest path is `/auth/register`, not `/auth/login`.** Registration
+hashes the new password, so it costs the same 216 ms, but only the per-IP limit
+applies to it — the per-email limit counts *failed logins* and never sees a
+registration. An attacker submitting fresh addresses pays the IP limit and
+nothing else. Login is marginally worse for them: an attacker hammering one
+address hits the 5-failure email limit, so spreading across ~4,200 target
+emails is required to match, which is more bookkeeping for the same effect.
+
+**What the limiter actually bought.** Before QJ-6, saturation took 5 concurrent
+attackers from a single machine. After, it takes ~2,080 coordinated addresses.
+That is roughly three orders of magnitude, which moves the attack from
+"anybody with a laptop and a for-loop" to "somebody who wants this specifically"
+— genuinely worth having, and genuinely not the same as closed.
+
+**What would actually close it**, none of which is in this ticket's scope:
+
+- **Raise or remove reserved concurrency.** The cap is a *cost* control, not a
+  security one — it exists so a runaway bill is impossible, and the account
+  limit is now 1,000 after the quota increase in QJ-3. Removing it trades a
+  service-availability DoS for a billing DoS. That is a real trade with a real
+  answer, not an obvious win.
+- **Get bcrypt off the request path for unauthenticated volume**, e.g. a proof
+  of work or a CAPTCHA ahead of registration. This attacks the actual root
+  cause, which is that an anonymous caller can spend 216 ms of our CPU for the
+  cost of one HTTP request.
+- **CloudFront + AWS WAF** for volumetric and reputation-based blocking at the
+  edge, before a request ever reaches Lambda. Ruled out as the *store* for this
+  ticket (see the table above — it cannot key on user ID, so it cannot satisfy
+  the per-user limit), but it is the right tool for exactly this problem and
+  would sit in front of, not instead of, what is built here.
+
+### Resources created by hand (QJ-5 will import these)
+
+| Resource | Identifier |
+| -------- | ---------- |
+| DynamoDB table | `quotejar-rate-limits`, PK `pk` (S), PAY_PER_REQUEST, TTL on `expires_at` |
+| VPC endpoint | `vpce-08940f1ea5dae1a5c` — **Gateway**, DynamoDB, on route table `rtb-08a5b21d76235cd7f` |
+| IAM inline policy | `quotejar-rate-limit-table` on role `quotejar-lambda-role` — `UpdateItem` and `GetItem`, scoped to that one table |
+
+    aws dynamodb create-table --table-name quotejar-rate-limits \
+      --attribute-definitions AttributeName=pk,AttributeType=S \
+      --key-schema AttributeName=pk,KeyType=HASH \
+      --billing-mode PAY_PER_REQUEST
+    aws dynamodb update-time-to-live --table-name quotejar-rate-limits \
+      --time-to-live-specification "Enabled=true,AttributeName=expires_at"
+    aws ec2 create-vpc-endpoint --vpc-id vpc-0a7d500454d8fec5b \
+      --vpc-endpoint-type Gateway \
+      --service-name com.amazonaws.us-east-1.dynamodb \
+      --route-table-ids rtb-08a5b21d76235cd7f
+
+Teardown, in addition to the QJ-3 script:
+
+    aws dynamodb delete-table --table-name quotejar-rate-limits
+    aws ec2 delete-vpc-endpoints --vpc-endpoint-ids vpce-08940f1ea5dae1a5c
+    aws iam delete-role-policy --role-name quotejar-lambda-role \
+      --policy-name quotejar-rate-limit-table
+
+### Testing the real store
+
+The suite uses an in-memory store, so it never reaches AWS and needs no
+credentials — `boto3` is deliberately absent from `requirements-dev.txt` so a
+forgotten fixture cannot silently start writing to a real table. To exercise
+the DynamoDB path by hand:
+
+    pip install boto3 "botocore[crt]"    # crt is needed for `aws login` credentials
+
+Then drive `RateLimiter(DynamoDBStore("quotejar-rate-limits"))` directly.
+
 ## Known gaps
 
 Deliberately not built. Each is a real omission rather than an oversight, and
@@ -861,11 +1223,9 @@ have this excuse and does not leak: both failure modes return byte-identical
 responses, and login runs bcrypt even for unknown addresses so response
 timing cannot distinguish them either.
 
-**Rate limiting.** Nothing throttles `/auth/login`, so online password
-guessing is bounded only by bcrypt's ~230 ms per attempt. That is a real
-speed bump — a few hundred guesses a minute rather than millions — but it is
-a side effect of the hashing cost, not a deliberate control. Registration is
-likewise unthrottled, so the endpoint can be used to create accounts in bulk.
+**~~Rate limiting.~~** Closed in QJ-6. Login and registration are limited per
+IP, repeated login failures are limited per email address, and authenticated
+endpoints are limited per user ID. See [Rate limiting](#rate-limiting).
 
 **OAuth / social login.** No third-party identity providers. Worth being
 precise here, because the code uses `OAuth2PasswordRequestForm` and that

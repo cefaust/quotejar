@@ -26,7 +26,14 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.dependencies import CurrentUser, DbSession
+from app.config import settings
+from app.dependencies import (
+    AuthIpRateLimit,
+    CurrentUser,
+    DbSession,
+    _too_many_requests,
+    limiter,
+)
 from app.models import User
 from app.schemas import Token, UserCreate, UserRead
 from app.security import create_access_token, hash_password, verify_password
@@ -40,7 +47,12 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 _DUMMY_HASH = hash_password("a-password-that-is-never-anyone's")
 
 
-@router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/register",
+    response_model=UserRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[AuthIpRateLimit],
+)
 def register(payload: UserCreate, db: DbSession) -> User:
     user = User(
         email=payload.email,
@@ -88,7 +100,7 @@ def register(payload: UserCreate, db: DbSession) -> User:
     return user
 
 
-@router.post("/login", response_model=Token)
+@router.post("/login", response_model=Token, dependencies=[AuthIpRateLimit])
 def login(
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
     db: DbSession,
@@ -102,6 +114,28 @@ def login(
     names. It is the one endpoint in this API that breaks JSON consistency,
     and that inconsistency is the price of the tooling.
     """
+    # The per-email limit, checked before any work happens.
+    #
+    # A second axis from the per-IP limit applied by the decorator, because the
+    # two protect different things and each is blind where the other sees. The
+    # IP limit protects the service from resource exhaustion; this protects one
+    # account from credential stuffing. An attacker with a botnet defeats the
+    # IP limit while every attempt still lands on one address, and conversely a
+    # shared NAT puts thousands of innocent users behind a single IP.
+    #
+    # Lowercased so Alice@example.com and alice@example.com share a bucket
+    # rather than handing an attacker a fresh allowance per capitalisation.
+    email_key = form_data.username.lower()
+    if settings.rate_limit_enabled:
+        decision = limiter.peek(
+            "auth-email",
+            email_key,
+            settings.auth_email_limit,
+            settings.auth_email_window_seconds,
+        )
+        if not decision.allowed:
+            raise _too_many_requests(decision)
+
     user = db.scalar(select(User).where(User.email == form_data.username))
 
     # Verify a password on every path, even when no such user exists.
@@ -118,9 +152,11 @@ def login(
     # CPU by design.
     if user is None:
         verify_password(form_data.password, _DUMMY_HASH)
+        _record_failure(email_key)
         raise _invalid_credentials()
 
     if not verify_password(form_data.password, user.password_hash):
+        _record_failure(email_key)
         raise _invalid_credentials()
 
     return Token(access_token=create_access_token(user.id))
@@ -137,6 +173,23 @@ def read_current_user(user: CurrentUser) -> User:
     without attempting a write.
     """
     return user
+
+
+def _record_failure(email_key: str) -> None:
+    """Count one failed attempt against the address that was tried.
+
+    Failures only. A user who types their password correctly has not attacked
+    anything, and counting successes would do two harmful things: penalise the
+    account's legitimate owner for using it, and hand an attacker a way to lock
+    someone out by deliberately failing at their address. That second one is
+    why account lockout is out of scope -- see README.md.
+
+    Recorded for unknown addresses too. Skipping it there would leak which
+    addresses exist: an attacker could tell registered from unregistered by
+    whether attempts started being throttled.
+    """
+    if settings.rate_limit_enabled:
+        limiter.record("auth-email", email_key, settings.auth_email_window_seconds)
 
 
 def _invalid_credentials() -> HTTPException:

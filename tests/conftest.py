@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from alembic import command
 from app.config import settings
 from app.db import get_db
+from app.dependencies import limiter
 from app.main import app
 from app.models import Child, User
 from app.security import create_access_token, hash_password
@@ -150,3 +151,41 @@ def other_child(db, other_user) -> Child:
     db.add(child)
     db.flush()
     return child
+
+
+class MemoryStore:
+    """Rate-limit counters in a dict. Same contract as DynamoDBStore.
+
+    Lives in conftest rather than the test module because every test needs it,
+    not only the rate-limit tests -- see isolated_rate_limiter below.
+    """
+
+    def __init__(self) -> None:
+        self.counts: dict[str, int] = {}
+
+    def increment(self, key: str, window_seconds: int) -> int:
+        self.counts[key] = self.counts.get(key, 0) + 1
+        return self.counts[key]
+
+    def get(self, key: str) -> int:
+        return self.counts.get(key, 0)
+
+
+@pytest.fixture(autouse=True)
+def isolated_rate_limiter():
+    """Give every test its own empty rate-limit store.
+
+    Autouse, and not optional. Without it the suite's behaviour depends on
+    whether boto3 happens to be installed and whether AWS credentials happen to
+    be present: with neither, the limiter fails open and every test passes; with
+    both, the tests write to the *production* DynamoDB table and start
+    throttling each other. That was not hypothetical -- it produced 35 rows in
+    the real table and six failures asserting `429 == 401`.
+
+    Fresh per test as well as isolated, so one test exhausting a limit cannot
+    leak into the next and produce failures that depend on execution order.
+    """
+    original = limiter.store
+    limiter.store = MemoryStore()
+    yield
+    limiter.store = original

@@ -18,7 +18,7 @@ import uuid
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 
-from app.dependencies import CurrentUser, DbSession
+from app.dependencies import DbSession, RateLimitedUser
 from app.models import Child
 from app.schemas import ChildCreate, ChildRead
 
@@ -26,7 +26,7 @@ router = APIRouter(prefix="/children", tags=["children"])
 
 
 @router.post("", response_model=ChildRead, status_code=status.HTTP_201_CREATED)
-def create_child(payload: ChildCreate, user: CurrentUser, db: DbSession) -> Child:
+def create_child(payload: ChildCreate, user: RateLimitedUser, db: DbSession) -> Child:
     # user_id comes from the token, never from the request body.
     #
     # This is the whole ballgame for write-side access control. If the client
@@ -43,7 +43,7 @@ def create_child(payload: ChildCreate, user: CurrentUser, db: DbSession) -> Chil
 
 
 @router.get("", response_model=list[ChildRead])
-def list_children(user: CurrentUser, db: DbSession) -> list[Child]:
+def list_children(user: RateLimitedUser, db: DbSession) -> list[Child]:
     return list(
         db.scalars(
             select(Child).where(Child.user_id == user.id).order_by(Child.created_at)
@@ -52,7 +52,7 @@ def list_children(user: CurrentUser, db: DbSession) -> list[Child]:
 
 
 @router.get("/{child_id}", response_model=ChildRead)
-def get_child(child_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Child:
+def get_child(child_id: uuid.UUID, user: RateLimitedUser, db: DbSession) -> Child:
     child = db.scalar(
         select(Child).where(Child.id == child_id, Child.user_id == user.id)
     )

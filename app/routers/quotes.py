@@ -34,7 +34,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from sqlalchemy import Select, func, select
 
-from app.dependencies import CurrentUser, DbSession
+from app.dependencies import DbSession, RateLimitedUser
 from app.models import Child, Quote
 from app.schemas import QuoteCreate, QuotePage, QuoteRead
 
@@ -102,7 +102,7 @@ def _not_found() -> HTTPException:
 
 
 @router.post("", response_model=QuoteRead, status_code=status.HTTP_201_CREATED)
-def create_quote(payload: QuoteCreate, user: CurrentUser, db: DbSession) -> Quote:
+def create_quote(payload: QuoteCreate, user: RateLimitedUser, db: DbSession) -> Quote:
     # The child_id arrives in the request body, which makes it attacker-
     # controlled. Checking only that the child exists -- QJ-1's behaviour --
     # would let anyone attach quotes to anyone else's child by guessing or
@@ -126,7 +126,7 @@ def create_quote(payload: QuoteCreate, user: CurrentUser, db: DbSession) -> Quot
 
 @router.get("", response_model=QuotePage)
 def list_quotes(
-    user: CurrentUser,
+    user: RateLimitedUser,
     db: DbSession,
     child_id: uuid.UUID | None = None,
     limit: int = Query(20, ge=1, le=100),
@@ -173,7 +173,7 @@ def list_quotes(
 
 
 @router.get("/{quote_id}", response_model=QuoteRead)
-def get_quote(quote_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Quote:
+def get_quote(quote_id: uuid.UUID, user: RateLimitedUser, db: DbSession) -> Quote:
     # Ownership is a WHERE clause, not an if-statement after the fetch.
     #
     # Fetching first and checking after works, but it leaves a window: the row
@@ -187,7 +187,7 @@ def get_quote(quote_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Quote:
 
 
 @router.delete("/{quote_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_quote(quote_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Response:
+def delete_quote(quote_id: uuid.UUID, user: RateLimitedUser, db: DbSession) -> Response:
     quote = db.scalar(_visible_quotes(user.id).where(Quote.id == quote_id))
     if quote is None:
         raise _not_found()

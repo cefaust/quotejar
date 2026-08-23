@@ -7,12 +7,14 @@ lives here, as a single injectable that yields the User or refuses the request.
 from typing import Annotated
 
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db import get_db
 from app.models import User
+from app.ratelimit import Decision, DynamoDBStore, RateLimiter
 from app.security import decode_access_token
 
 # tokenUrl is documentation, not routing. FastAPI never calls it; it is
@@ -134,3 +136,107 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
 # `Annotated` types can be aliased, reused, and read by type checkers, where a
 # default-argument Depends cannot.
 DbSession = Annotated[Session, Depends(get_db)]
+
+
+# --- Rate limiting ---------------------------------------------------------
+
+# Built once, at import. Same reasoning as the SQLAlchemy engine and the
+# Secrets Manager fetch: module-level code runs once per cold start, handler
+# code runs per invocation. Constructing a boto3 client per request would add
+# a service-model load to every call.
+limiter = RateLimiter(DynamoDBStore(settings.rate_limit_table))
+
+
+def client_ip(request: Request) -> str:
+    """The caller's address, from the one source that cannot be forged.
+
+    `request.client.host` comes from `requestContext.http.sourceIp`, which AWS
+    populates from the actual TCP connection. A caller cannot influence it.
+
+    **X-Forwarded-For is deliberately ignored, and this is the whole point.**
+    Most rate-limiting guidance says to prefer it, because most deployments sit
+    behind a load balancer that sets it. Nothing sits in front of this Function
+    URL, so the header arrives exactly as the client typed it. Verified
+    directly: a request carrying `X-Forwarded-For: 1.2.3.4` still reports
+    sourceIp as its real address, and the header passes through untouched.
+    Keying on it would let an attacker defeat every IP limit by incrementing a
+    header, which is worse than having no limit at all -- it would look like
+    protection while providing none.
+
+    **What must change if anything is ever put in front.** Adding CloudFront
+    (as the WAF option in QJ-6 would have required) makes sourceIp CloudFront's
+    address, so every user in the world collapses into a handful of edge IPs
+    and the limit becomes global. At that point the correct source is the
+    rightmost untrusted entry in X-Forwarded-For, or `CloudFront-Viewer-Address`
+    -- but only once the origin is locked down so the Function URL cannot be
+    reached directly, because otherwise an attacker skips the proxy and forges
+    the header anyway.
+    """
+    return request.client.host if request.client else "unknown"
+
+
+def _too_many_requests(decision: Decision) -> HTTPException:
+    """429 with enough information for a client to behave well.
+
+    Retry-After alongside the RateLimit-* fields: the former is RFC 9110 and
+    almost universally understood, the latter is the newer IETF draft and
+    carries the full quota picture. Sending both means any client that
+    understands either can back off correctly.
+    """
+    headers = decision.headers()
+    headers["Retry-After"] = str(decision.reset_seconds)
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail="Too many requests. Please retry later.",
+        headers=headers,
+    )
+
+
+def enforce_auth_ip_limit(request: Request) -> None:
+    """Per-IP limit for login and register.
+
+    Applied before the handler runs, so a rejected request never reaches
+    bcrypt. That ordering is the entire defence: the cost being rationed is
+    216 ms of CPU, and a limiter that ran afterwards would ration nothing.
+    """
+    if not settings.rate_limit_enabled:
+        return
+    decision = limiter.check(
+        "auth-ip",
+        client_ip(request),
+        settings.auth_ip_limit,
+        settings.auth_ip_window_seconds,
+    )
+    if not decision.allowed:
+        raise _too_many_requests(decision)
+
+
+def enforce_user_limit(user: CurrentUser) -> User:
+    """Per-user-ID limit for authenticated endpoints.
+
+    Runs after get_current_user, so the token has already been validated and
+    there is a real identity to key on.
+    """
+    if not settings.rate_limit_enabled:
+        return user
+    decision = limiter.check(
+        "user",
+        str(user.id),
+        settings.authenticated_limit,
+        settings.authenticated_window_seconds,
+    )
+    if not decision.allowed:
+        raise _too_many_requests(decision)
+    return user
+
+
+# Endpoints write `user: RateLimitedUser` instead of `user: CurrentUser` to opt
+# into the per-user limit. Keeping them as separate aliases makes the choice
+# explicit at each endpoint rather than hidden in middleware -- /auth/me, for
+# instance, is deliberately cheap and does not need throttling beyond what the
+# login limit already provides.
+RateLimitedUser = Annotated[User, Depends(enforce_user_limit)]
+
+# Applied with Depends() in the decorator rather than as a parameter, since the
+# handler has no use for its return value.
+AuthIpRateLimit = Depends(enforce_auth_ip_limit)
