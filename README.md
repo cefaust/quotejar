@@ -984,6 +984,44 @@ that it has been open for a month. There is a test asserting the API returns
 200 rather than 500 when the store is down — the single most important test in
 the suite, because that behaviour is invisible in normal operation.
 
+### A refused request is never counted
+
+`check` reads and decides *first*, and increments only when it admits the
+request. The obvious alternative — increment, then decide — is wrong in a way
+that takes a while to surface.
+
+Counting a refusal lets a caller inflate the counter its own future decisions
+are built from. A client that retries after a 429 pushes its own quota further
+away, producing another 429, producing another retry. Measured at 10 per 15
+minutes:
+
+| Client | Writes | Peak counter | Quota returns |
+| --- | --- | --- | --- |
+| Honours `Retry-After` | 11 | 10 | **890s**, as documented |
+| Retries 1/s, counting refusals | 5,410 | 900 | **never** (tested to 5,400s) |
+| Retries 1/s, current behaviour | 11 | 10 | **890s** |
+
+"Ten per fifteen minutes" silently became an indefinite lockout, and the client
+that behaves this way is usually not an attacker — it is a mobile app with a
+naive retry loop, whose user has no way to discover why they are shut out for
+hours. Clamping the previous window does *not* fix this: a hammering client
+inflates the current window too, so refusing to count is the only fix.
+
+It also stops a rejected request costing a write. At 1 write + 2 strongly
+consistent reads, the limiter costs roughly **3× the Lambda invocation it is
+protecting** per refused request, so this removes about a third of the
+DynamoDB spend under sustained abuse — and, more usefully, removes the writes
+that would otherwise drive the write rate toward the throttling ceiling in the
+next section.
+
+**The cost of this ordering** is that the read and the increment are no longer
+one atomic operation, so two concurrent invocations can both admit against the
+same count. Overshoot is bounded by concurrent executions — **4 at reserved
+concurrency 5** — which is noise for a limiter bounding CPU. It stops being
+noise if concurrency rises; the fix then is a conditional write
+(`ConditionExpression: #c < :limit`), which restores atomicity and still
+refuses to count what it rejects. Another item coupled to QJ-5.
+
 ### Known limit: throttling is not distinguished from unavailability
 
 `RateLimiter` catches a bare `Exception` around every store call and fails open

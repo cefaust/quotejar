@@ -40,7 +40,9 @@ overlaps the trailing window.
 
     estimate = previous_count * (1 - elapsed_fraction) + current_count
 
-Two small items per key and one atomic increment.
+Two small items per key, two reads per decision, and one atomic increment per
+*admitted* request -- a refused one is never counted, for the reasons in
+`RateLimiter.check`.
 
 ## What the approximation costs
 
@@ -212,8 +214,8 @@ class RateLimiter:
     # Three operations rather than one, because the two kinds of limit here
     # count different things.
     #
-    # An IP limit counts *requests*: every attempt is a unit of load, so every
-    # attempt is counted and checked together -- that is `check`.
+    # An IP limit counts *admitted requests*: `check` decides first and counts
+    # only what it lets through.
     #
     # An email limit counts *failures*: it exists to slow brute force against
     # one account, and a user who types their password correctly has not
@@ -222,53 +224,78 @@ class RateLimiter:
     # attacker lock someone out by simply logging in wrongly at them. So the
     # check (`peek`) happens before the attempt and the increment (`record`)
     # only after one fails.
+    #
+    # What both have in common is that **a refused request is never counted**.
+    # See `check` for why that is load-bearing rather than an optimisation.
 
     def check(
         self, scope: str, identifier: str, limit: int, window_seconds: int
     ) -> Decision:
-        """Count this request, then decide. Used where every request is load."""
+        """Decide first, and count the request only if it was allowed.
+
+        The ordering is the point, and the obvious alternative -- increment,
+        then decide -- is wrong in a way that takes a while to surface.
+
+        Counting a request that was refused lets a caller inflate the counter
+        that its own future decisions are built from. A client that retries
+        after a 429 pushes its own quota further away, which produces another
+        429, which produces another retry. Measured at ten per fifteen minutes,
+        a client retrying once a second never recovers: the documented limit
+        stops being "ten per fifteen minutes" and becomes an indefinite
+        lockout. The client most likely to do that is not an attacker, it is a
+        mobile app with a naive retry loop, and the user has no way to know
+        why they are shut out for hours.
+
+        Refusing without counting also stops a rejected request costing a
+        write. That is the smaller benefit -- roughly a third of the DynamoDB
+        spend under sustained abuse -- but it matters for the throttling
+        limit documented in README.md, because the writes from refused
+        requests are exactly what drives the write rate toward the
+        per-partition-key ceiling.
+
+        **The cost of this ordering** is that the read and the increment are no
+        longer one atomic operation. Two invocations can both read the same
+        count and both admit a request, so the effective limit can overshoot
+        by up to the number of concurrent executions -- four, at reserved
+        concurrency of five. That is noise for a limiter whose job is bounding
+        CPU. It stops being noise if concurrency is raised, and the fix then is
+        a conditional write (`ConditionExpression: #c < :limit`), which keeps
+        atomicity and still refuses to count what it rejects.
+        """
+        decision = self._decide(scope, identifier, limit, window_seconds)
+        if not decision.allowed:
+            return decision
+
         try:
             self._increment(scope, identifier, window_seconds)
         except Exception:
-            return self._fail_open(scope, limit, window_seconds)
-        # pending=0: the increment above already put this request in the count,
-        # so the stored total is the answer to "how many including this one".
-        return self._decide(scope, identifier, limit, window_seconds, pending=0)
+            # The read already answered "allowed", so the request proceeds
+            # either way. A failure here only means the count is short by one.
+            logger.error(
+                "could not count an admitted request: scope=%s", scope, exc_info=True
+            )
+        return decision
 
     def peek(
         self, scope: str, identifier: str, limit: int, window_seconds: int
     ) -> Decision:
         """Decide without counting. Used before an attempt that may not count."""
-        # pending=1: nothing has been incremented, so the stored total covers
-        # only *previous* attempts. The attempt being authorised right now has
-        # to be added in, or it is decided against a count it is missing from.
-        return self._decide(scope, identifier, limit, window_seconds, pending=1)
+        return self._decide(scope, identifier, limit, window_seconds)
 
     def _decide(
-        self,
-        scope: str,
-        identifier: str,
-        limit: int,
-        window_seconds: int,
-        pending: int,
+        self, scope: str, identifier: str, limit: int, window_seconds: int
     ) -> Decision:
-        """Weigh the stored counters and answer allow/deny.
+        """Would one more request, right now, stay inside the limit?
 
-        `pending` is the load-bearing argument, and getting it wrong is an
-        off-by-one that silently loosens a security control by one attempt.
+        Neither caller has incremented anything by the time this runs, so the
+        stored counters describe *previous* traffic only and the request being
+        judged has to be added in -- that is the `+ 1` below.
 
-        Both callers ask the same question -- "if this request proceeds, does
-        the total stay within the limit?" -- but they ask it at different
-        points. `check` has already incremented, so the request is in the
-        stored count and `pending` is 0. `peek` runs before anything is
-        recorded, so the request it is authorising is *not* in the stored
-        count and must be added, hence 1.
-
-        Sharing one comparison with an explicit `pending` is what keeps the two
-        aligned. The original bug was `check` delegating to `peek` and
-        inheriting a comparison written for the counted case: standalone
-        `peek` then allowed `limit + 1` attempts, so `auth_email_limit = 5`
-        actually permitted six failed logins before throttling.
+        Forgetting it is an off-by-one that silently loosens a security
+        control. It was a real bug here: `check` used to increment first and
+        then borrow `peek`'s comparison, so a standalone `peek` decided
+        against a total its own request was missing from and allowed
+        `limit + 1`. `auth_email_limit = 5` permitted six failed logins.
         """
         now = time.time()
         current_start = int(now // window_seconds) * window_seconds
@@ -281,7 +308,7 @@ class RateLimiter:
         except Exception:
             return self._fail_open(scope, limit, window_seconds)
 
-        estimate = previous * (1 - elapsed_fraction) + current + pending
+        estimate = previous * (1 - elapsed_fraction) + current + 1
         return Decision(
             allowed=estimate <= limit,
             limit=limit,

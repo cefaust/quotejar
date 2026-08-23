@@ -199,6 +199,73 @@ def test_check_and_peek_agree_on_what_a_limit_permits():
         assert via_peek == limit, f"peek allowed {via_peek} against limit {limit}"
 
 
+# --- refusals must not compound --------------------------------------------
+
+
+def test_a_refused_request_is_not_counted():
+    """The counter records what was admitted, never what was turned away.
+
+    Counting a refusal lets a caller inflate the very number its own future
+    decisions are built from. The direct consequence is the lockout in the
+    next test; the secondary one is that every rejected request would cost a
+    DynamoDB write, which is also what pushes the write rate toward the
+    per-partition-key throttling ceiling described in README.md.
+    """
+    store = MemoryStore()
+    rl = RateLimiter(store)
+
+    for _ in range(5):
+        rl.check("scope", "id", limit=5, window_seconds=60)
+    after_quota_spent = dict(store.counts)
+
+    for _ in range(50):
+        assert not rl.check("scope", "id", limit=5, window_seconds=60).allowed
+
+    assert store.counts == after_quota_spent, "a refused request was counted"
+
+
+def test_a_client_that_ignores_429_still_gets_its_quota_back(monkeypatch):
+    """A retry loop must not push its own quota further away.
+
+    `check` used to increment before deciding, so every rejected retry raised
+    the counter that the next window's estimate is built from. A client
+    retrying once a second never recovered -- "ten per fifteen minutes"
+    silently became an indefinite lockout. The client that behaves this way is
+    usually not an attacker but a mobile app with a naive retry loop, and its
+    user has no way to find out why they are shut out for hours.
+
+    Time is advanced rather than slept; an hour-long test is a deleted test.
+    """
+    import app.ratelimit as rlmod
+
+    now = 1_000_000.0
+    monkeypatch.setattr(rlmod.time, "time", lambda: now)
+
+    store = MemoryStore()
+    rl = RateLimiter(store)
+    start = now
+
+    # Spend the quota, then keep hammering through this window and the next,
+    # ignoring every refusal.
+    while now < start + 1800:
+        rl.check("scope", "id", limit=10, window_seconds=900)
+        now += 1
+
+    # No window counter may exceed the limit: that is the invariant that
+    # keeps the carry-over into the next window bounded.
+    assert max(store.counts.values()) <= 10
+
+    # A full window later the client is being served again, at close to its
+    # full allowance rather than nothing at all.
+    admitted = 0
+    while now < start + 2700:
+        if rl.check("scope", "id", limit=10, window_seconds=900).allowed:
+            admitted += 1
+        now += 1
+
+    assert 8 <= admitted <= 10, f"admitted {admitted} in the window, expected ~10"
+
+
 # --- fail open -------------------------------------------------------------
 
 
