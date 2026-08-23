@@ -5,3 +5,28 @@ __pycache__/
 .pytest_cache/
 .coverage
 *.egg-info/
+
+# --- Terraform -------------------------------------------------------------
+# Provider binaries: hundreds of MB, re-downloaded by `terraform init`.
+terraform/.terraform/
+
+# State, and any local copy of it. This is the one that matters: state holds
+# secret values in plaintext -- the RDS password among them -- so a committed
+# state file publishes the database credentials. State lives in S3.
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Crash logs can contain state fragments, and therefore the same secrets.
+crash.log
+crash.*.log
+
+# Variable files are where people put secrets "just for now". The committed
+# config takes no secret inputs, so any .tfvars here is either unnecessary or
+# dangerous. terraform.tfvars.example, if one is ever added, stays tracked.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Saved plan files embed the full resource state, secrets included.
+*.tfplan
