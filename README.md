@@ -937,9 +937,26 @@ previous one, weighting the previous by how much still overlaps:
 
     estimate = previous_count × (1 − elapsed_fraction) + current_count
 
-Two small items per key, one atomic increment, no boundary burst. There is a
-test that specifically fires across a window boundary and asserts the second
-burst is rejected.
+Two small items per key and one atomic increment. There is a test that fires
+across a window boundary and asserts the second burst is rejected.
+
+**What the approximation costs.** The weighting assumes the previous window's
+traffic was spread evenly. Real traffic is bursty, so wherever it was skewed
+the estimate is wrong — and it errs in *both* directions, not only the safe
+one. Measured against an exact sliding log at a limit of 10 per 900s:
+
+| Traffic shape | Exact log | This limiter | Effect |
+| --- | --- | --- | --- |
+| 10 requests in the first 10s of a window, then idle; checked at t=910 | 0 in the trailing window → allow | credits ~98.9% of them → **deny** | a user who bursted is throttled after 15 idle minutes |
+| 10 at the end of one window, then again at the end of the next; checked at t=1789 | caps at 10 → deny | previous window 98.8% elapsed, contributes ~0.12 → **9 more allowed** | **19 in one trailing 900s window against a limit of 10** |
+
+So the sliding counter does not *eliminate* the fixed window's 2× boundary
+burst — it reshapes it. A fixed window lets 20 requests land in **one second**;
+this caps concentration at 10 per ~10 seconds with the two clusters 15 minutes
+apart. The sustained-rate error is comparable; the *instantaneous* burst is far
+better. Since what is being defended is CPU saturation, concentration is the
+number that matters, which is why the trade is still the right one — but "no
+boundary burst" would be an overstatement.
 
 ### Fail open, deliberately
 

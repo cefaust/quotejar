@@ -40,11 +40,34 @@ overlaps the trailing window.
 
     estimate = previous_count * (1 - elapsed_fraction) + current_count
 
-Two small items per key, one atomic increment, and no boundary burst -- at
-11:59:59 the previous window still counts almost fully, so the attacker above
-is rejected. It assumes traffic was evenly spread inside the previous window,
-which is an approximation, but it errs on the side of counting requests that
-have partially aged out rather than forgetting them.
+Two small items per key and one atomic increment.
+
+## What the approximation costs
+
+The weighting assumes traffic was spread **evenly** through the previous
+window. Real traffic is bursty, so wherever it was skewed the estimate is
+wrong -- in both directions, not just the safe one. Measured against an exact
+sliding log at a limit of 10 per 900s:
+
+**Skewed early -> false deny.** Ten requests in the first ten seconds of a
+window, then silence. At t=910 an exact log counts zero still inside the
+trailing window; they have genuinely aged out. This still credits ~98.9% of
+them and refuses. A user who bursted at 9:00:00 is throttled at 9:15:10 after
+fifteen idle minutes.
+
+**Skewed late -> false allow.** Ten requests at the very end of one window,
+ten more at the very end of the next. At t=1789 the previous window is 98.8%
+elapsed, so its ten requests contribute ~0.12 and nine more get through --
+**19 inside one trailing 900-second window against a limit of 10.**
+
+So this does *not* eliminate the fixed window's 2x burst; it reshapes it. A
+fixed window permits 20 requests in one second. This caps concentration at ten
+per ten seconds with the clusters fifteen minutes apart. The sustained-rate
+error is comparable; the *instantaneous* burst is far better, and since what
+is being defended is CPU saturation, concentration is the number that matters.
+
+An exact sliding log is the fix, at the cost of storing every timestamp -- see
+above for why that trade is refused here.
 """
 
 from __future__ import annotations
