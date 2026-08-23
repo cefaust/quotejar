@@ -833,6 +833,312 @@ image of this size. Nobody notices at this traffic level, and it is the
 explicit tradeoff for paying nothing while idle. Provisioned concurrency
 removes it and reintroduces a constant bill.
 
+## Infrastructure as code
+
+Everything in AWS is described by the Terraform configuration in
+[`terraform/`](terraform/) and adopted into its state. Before QJ-5 the only
+record of how any of it was built was shell history.
+
+    cd terraform
+    terraform plan     # should say "No changes"
+
+### What is managed, and what deliberately is not
+
+24 resources: the Lambda and its Function URL, the ECR repository, the RDS
+instance, three security groups, both VPC endpoints, the DynamoDB rate-limit
+table, two Secrets Manager entries, both IAM roles with their policies, the
+GitHub OIDC provider, the budget, the SNS topic, and both billing alarms.
+
+Three things are deliberately outside:
+
+| Not managed | Why |
+| --- | --- |
+| The S3 bucket holding this state | A configuration cannot safely manage its own state store. `terraform destroy` would delete the bucket partway through and orphan everything after it. |
+| The default VPC, subnets, route table | AWS created them and everything else sits inside them. Adopting them means `destroy` can take out the network. |
+| The Lambda's container image | CD owns it. See "The one place Terraform and CD overlap". |
+
+### Making an infrastructure change
+
+Apply runs from a laptop, not from CI. That is the right answer at this size
+and is revisited at the end of this section.
+
+1. **Edit the `.tf` file.** Resources are grouped by domain — `rds.tf`,
+   `lambda.tf`, `network.tf`, `iam.tf`, `monitoring.tf`, `ecr.tf`,
+   `dynamodb.tf`, `secrets.tf`.
+
+2. **Plan, and actually read it.**
+
+       terraform plan -out=tfplan
+
+3. **Search the plan for the only two strings that matter:**
+
+       # forces replacement
+       must be replaced
+
+   On most resources replacement is an inconvenience. On
+   `aws_db_instance.main` it means the database is deleted and a new empty one
+   created. Attributes that force replacement include `identifier`, `engine`,
+   and the subnet group on RDS; `name`, `description`, and `vpc_id` on a
+   security group; `function_name` on the Lambda; and the key schema on the
+   DynamoDB table.
+
+   Terraform prints this in red and does not otherwise stop you.
+
+4. **Apply the saved plan, not a fresh one.**
+
+       terraform apply tfplan
+
+   `terraform apply` on its own re-plans, so what runs may not be what you
+   read — infrastructure can have changed in between. Applying a saved plan
+   guarantees the actions are the ones reviewed.
+
+5. **Confirm it settled.**
+
+       terraform plan     # "No changes"
+
+For anything touching RDS, take a snapshot first. A plan is a prediction, not
+a promise.
+
+### Reading a plan safely
+
+The symbols matter more than the prose:
+
+| | |
+| --- | --- |
+| `+` create | new resource |
+| `~` update in place | safe; the resource survives |
+| `-/+` **destroy and then create** | **the resource is deleted.** Data goes with it |
+| `-` destroy | resource removed |
+
+A useful non-interactive check, which is what CI would use if it planned:
+
+    terraform plan -detailed-exitcode    # 0 = no changes, 2 = changes, 1 = error
+
+### State: what it is and why it is not on the laptop
+
+State is the mapping from Terraform addresses to real AWS resource IDs. It is
+how `aws_db_instance.main` is known to mean `quotejar-db`. It is the source of
+truth for what is managed — not AWS, and not the configuration.
+
+Losing it does not delete anything. It **orphans** everything: every resource
+keeps running and billing, none of it is managed, and the only route back is
+importing all 24 again.
+
+Local state fails in four ways at once:
+
+- **Invisible to anyone else.** A second person's `apply` starts from empty
+  state, sees no resources, and proposes creating a second production.
+- **One disk failure from gone.**
+- **Cannot be locked.** Nothing stops two concurrent applies.
+- **Contains secrets in plaintext** — the RDS master password among them —
+  in a working directory one `git add -A` from being published.
+
+The backend is S3 with versioning (a corrupted write is recoverable rather
+than fatal), default encryption, and public access blocked.
+
+### What state locking prevents
+
+Locking uses S3 conditional writes on a `.tflock` object next to the state
+(`use_lockfile`, Terraform ≥ 1.10). This replaced the old DynamoDB lock table,
+which needed a whole table to hold one boolean.
+
+The concrete failure it prevents: **two applies running at once both read the
+same state, both act, and the second write overwrites the first.** Say one run
+creates the RDS instance and another creates the Lambda. Both succeed in AWS.
+The state records only whichever wrote last. The other resource is live,
+billing, and invisible to Terraform — and the next plan offers to create a
+second copy of it.
+
+Worse in the other direction: a half-written state during a crash can leave
+Terraform believing a resource does not exist when it does, and the fix for
+"does not exist" is to create it. Versioning on the bucket is the recovery
+path when that happens.
+
+### Secrets, and where they still leak
+
+Terraform manages the secret *containers*. It never manages their values —
+there is no `aws_secretsmanager_secret_version` in this configuration and
+there must not be, because a value has to come from a variable, a file, or a
+literal, and all three end up in state.
+
+**Keeping values out of `.tf` files is necessary and not sufficient. The state
+file is the leak.** `terraform show -json` prints, in plaintext:
+
+- the **RDS master password**, because `aws_db_instance.password` is stored in
+  state whether or not it appears in any configuration file
+- any secret value a resource reads
+
+Terraform state has no encrypted field. `sensitive = true` only redacts CLI
+*display*; the value sits in the JSON in the clear. Hence bucket encryption,
+public access blocked, and `*.tfstate` in `.gitignore`. **A state file
+committed to git publishes the database password to everyone who can read the
+repository, and rewriting history does not un-publish it.**
+
+Three secondary leaks worth naming:
+
+- `terraform plan` output shows values it is about to change, so a plan pasted
+  into a PR comment or a CI log exposes them. One reason CI runs no plan.
+- a saved plan file embeds the same values — `*.tfplan` is gitignored too.
+- `terraform output` prints outputs regardless of sensitivity marking.
+
+### Drift
+
+Drift is reality diverging from configuration — someone changes something in
+the console, or a service changes a default.
+
+Terraform refreshes every resource at the start of a plan, so drift shows up
+as a diff. It does not warn separately or treat it differently; it simply
+proposes changing reality back. **That is the danger**: a plan run to make one
+small change will also silently include a revert of an unrelated console fix
+someone made during an incident. Which is the argument for reading plans in
+full, and for not making console changes.
+
+    terraform plan -refresh-only    # show drift without proposing to fix it
+
+### The one place Terraform and CD overlap
+
+`aws_lambda_function.api` carries:
+
+    lifecycle {
+      ignore_changes = [image_uri, description]
+    }
+
+CD runs `aws lambda update-function-code` with the commit SHA on every push to
+`main`. Terraform's configuration holds whichever SHA was current when it was
+written. Without `ignore_changes` the two fight, and the next `apply` **rolls
+production back to an older image** — a rollback that looks like a successful
+apply.
+
+Terraform owns the function's shape: memory, timeout, role, networking,
+concurrency. CD owns what runs inside it.
+
+### CI
+
+[`.github/workflows/terraform.yml`](.github/workflows/terraform.yml) runs
+`fmt -check` and `validate` on every push and PR. It holds **no AWS
+credentials**.
+
+`terraform plan` on the PR was considered and declined. Plan is not a
+read-only report — it *executes code*: providers run, and an `external` data
+source shells out to whatever it points at. The config being planned is the
+config in the pull request. A plan job with credentials is therefore arbitrary
+code execution against this account, gated only by who can open a PR. With the
+deploy role that is write access; even read-only lets a PR enumerate the
+account.
+
+`init -backend=false` is what lets the job exist without secrets: it downloads
+provider schemas, which is all `validate` needs, and never contacts S3. The
+honest cost is that CI cannot catch drift or a forced replacement. That check
+happens in the local plan — the same place the apply happens.
+
+### Proof that it rebuilds
+
+A configuration that has never rebuilt anything is a guess. The DynamoDB
+rate-limit table was destroyed and recreated from config alone:
+
+    $ terraform destroy -target=aws_dynamodb_table.rate_limits
+    Destroy complete! Resources: 2 destroyed.
+
+Two, not one: Terraform found that `aws_iam_role_policy.lambda_rate_limit_table`
+references the table's ARN and took it as well.
+
+    $ aws dynamodb describe-table --table-name quotejar-rate-limits
+    ResourceNotFoundException: Requested resource not found
+
+    $ terraform apply
+    Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
+
+The rebuilt table and its TTL configuration diffed **identical** to the
+originals, and the limiter resumed writing counters to the new table and
+enforcing at its configured values.
+
+**The rebuild found a real defect, which is the argument for the exercise.**
+The first apply failed:
+
+    Error: Cannot import non-existent remote object
+
+The `import` blocks used for adoption were still in the configuration. An
+import block asserts "this already exists", which is true exactly once —
+so every subsequent rebuild fails, at precisely the moment a rebuild is most
+wanted. They were removed; state is the record of what is managed, and git
+holds the adoption history.
+
+**A second thing fell out of it.** With the table genuinely gone, twelve
+logins returned `401` — no `429`s and no `500`s. That is QJ-6's fail-open path
+exercised against a real missing store rather than a test double. A limiter
+that failed closed would have taken the API down with its dependency.
+
+### Teardown, through Terraform
+
+Replaces the CLI sequence in the Deployment section, which is kept only for
+disaster recovery.
+
+    cd terraform
+    terraform plan -destroy -out=destroy.tfplan   # read it first
+    terraform apply destroy.tfplan
+
+Four things this does **not** handle, all deliberate:
+
+1. **The state bucket survives**, because it is not managed. Remove it last
+   and only if you mean it — it is the record of everything:
+
+       aws s3 rm s3://quotejar-tfstate-782747473074 --recursive
+       aws s3api delete-bucket --bucket quotejar-tfstate-782747473074
+
+2. **ECR refuses while images remain** (`force_delete` is false, on purpose —
+   it stops a stray destroy deleting the artefact every past deploy points at):
+
+       aws ecr delete-repository --repository-name quotejar --force
+
+3. **Secrets are scheduled, not deleted.** `recovery_window_in_days = 30`
+   means the names stay reserved for 30 days, so a rebuild inside that window
+   cannot reuse them:
+
+       aws secretsmanager delete-secret --secret-id quotejar/database-url \
+         --force-delete-without-recovery
+
+4. **`terraform destroy` will refuse to touch the RDS instance**, by design.
+   `aws_db_instance.main` carries `prevent_destroy = true`, so the destroy
+   fails with an error naming the resource rather than deleting it.
+
+   That guard exists because **`skip_final_snapshot` is `true`** — inherited
+   from QJ-3, where it was correct: a retained snapshot keeps billing for
+   storage after the instance is gone, the classic forgotten charge. Under
+   Terraform the same setting means a mistargeted destroy takes the database
+   with **no snapshot and no way back**.
+
+   To actually delete the database, remove the `lifecycle` block in
+   `terraform/rds.tf` first — a deliberate edit, which is the entire point.
+   Take a snapshot before you do:
+
+       aws rds create-db-snapshot --db-instance-identifier quotejar-db \
+         --db-snapshot-identifier quotejar-final-$(date +%Y%m%d)
+
+To stop the meter without losing the config, destroy only what costs money —
+RDS (~$16/month with its public IPv4) and the Secrets Manager interface
+endpoint (~$7/month) are together ~90% of the bill:
+
+    terraform destroy -target=aws_db_instance.main \
+                      -target=aws_vpc_endpoint.secretsmanager
+
+### Before `apply` could move into CD
+
+Manual apply is correct at this size. Automating it needs, at minimum:
+
+- **A plan/apply split with a human gate.** Plan on PR, apply on merge, with a
+  GitHub Environment requiring approval. Never plan-and-apply in one job.
+- **A different credential story.** The deploy role's permissions are scoped
+  to updating a Lambda; a Terraform role needs create and delete on
+  everything, which is a far larger blast radius to hand to a workflow file
+  that a PR can edit.
+- **An answer to the plan-executes-code problem** — at minimum, refusing to
+  run on PRs from forks and pinning the provider by hash.
+- ~~**A destroy guard.** `prevent_destroy` on the RDS instance.~~ Done in this
+  ticket — writing this list is what surfaced that the guard was missing while
+  `skip_final_snapshot` was `true`, which meant any destroy was unrecoverable.
+- **State locking under contention**, which already works but has never been
+  tested with two runners racing.
+
 ## Rate limiting
 
 ### The problem it solves
@@ -1158,31 +1464,24 @@ That is roughly three orders of magnitude, which moves the attack from
   the per-user limit), but it is the right tool for exactly this problem and
   would sit in front of, not instead of, what is built here.
 
-### Resources created by hand (QJ-5 will import these)
+### Supporting resources
 
-| Resource | Identifier |
-| -------- | ---------- |
-| DynamoDB table | `quotejar-rate-limits`, PK `pk` (S), PAY_PER_REQUEST, TTL on `expires_at` |
-| VPC endpoint | `vpce-08940f1ea5dae1a5c` — **Gateway**, DynamoDB, on route table `rtb-08a5b21d76235cd7f` |
-| IAM inline policy | `quotejar-rate-limit-table` on role `quotejar-lambda-role` — `UpdateItem` and `GetItem`, scoped to that one table |
+~~Created by hand; QJ-5 will import these.~~ **Adopted into Terraform in
+QJ-5** — see [Infrastructure as code](#infrastructure-as-code). They are
+defined in [`terraform/dynamodb.tf`](terraform/dynamodb.tf),
+[`terraform/network.tf`](terraform/network.tf), and
+[`terraform/iam.tf`](terraform/iam.tf), and no longer need creating or tearing
+down by hand.
 
-    aws dynamodb create-table --table-name quotejar-rate-limits \
-      --attribute-definitions AttributeName=pk,AttributeType=S \
-      --key-schema AttributeName=pk,KeyType=HASH \
-      --billing-mode PAY_PER_REQUEST
-    aws dynamodb update-time-to-live --table-name quotejar-rate-limits \
-      --time-to-live-specification "Enabled=true,AttributeName=expires_at"
-    aws ec2 create-vpc-endpoint --vpc-id vpc-0a7d500454d8fec5b \
-      --vpc-endpoint-type Gateway \
-      --service-name com.amazonaws.us-east-1.dynamodb \
-      --route-table-ids rtb-08a5b21d76235cd7f
+| Resource | Identifier | Managed in |
+| -------- | ---------- | ---------- |
+| DynamoDB table | `quotejar-rate-limits`, PK `pk` (S), PAY_PER_REQUEST, TTL on `expires_at` | `dynamodb.tf` |
+| VPC endpoint | `vpce-08940f1ea5dae1a5c` — **Gateway**, DynamoDB, on route table `rtb-08a5b21d76235cd7f` | `network.tf` |
+| IAM inline policy | `quotejar-rate-limit-table` on role `quotejar-lambda-role` — `UpdateItem` and `GetItem`, scoped to that one table | `iam.tf` |
 
-Teardown, in addition to the QJ-3 script:
-
-    aws dynamodb delete-table --table-name quotejar-rate-limits
-    aws ec2 delete-vpc-endpoints --vpc-endpoint-ids vpce-08940f1ea5dae1a5c
-    aws iam delete-role-policy --role-name quotejar-lambda-role \
-      --policy-name quotejar-rate-limit-table
+This table is the one the rebuild proof destroys and recreates, because it
+holds only ephemeral counters. Doing so also demonstrated the limiter's
+fail-open behaviour against a genuinely absent store.
 
 ### Testing the real store
 
