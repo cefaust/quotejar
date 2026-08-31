@@ -1000,7 +1000,7 @@ full, and for not making console changes.
 `aws_lambda_function.api` carries:
 
     lifecycle {
-      ignore_changes = [image_uri, description]
+      ignore_changes = [image_uri, code_sha256, description]
     }
 
 CD runs `aws lambda update-function-code` with the commit SHA on every push to
@@ -1011,6 +1011,30 @@ apply.
 
 Terraform owns the function's shape: memory, timeout, role, networking,
 concurrency. CD owns what runs inside it.
+
+**`code_sha256` was missed the first time, and the next deploy found it.** The
+list originally held only `image_uri` and `description`. The plan was clean
+when QJ-5 merged and stopped being clean the moment CD deployed:
+
+    ~ code_sha256 = "18f26940..." -> "11d977d1..."   # reverting to the old image
+
+`code_sha256` is the digest of the deployed image — a description of the
+artefact, not a setting. `-generate-config-out` emitted it as a literal
+because it was reading a live resource, which pinned the config to whatever
+was deployed that day. It is now omitted from the configuration entirely, so
+the provider treats it as computed, *and* named in `ignore_changes` as a guard
+against anyone regenerating the config and reintroducing it.
+
+The general lesson, which is worth more than the fix: **a clean plan is a
+statement about one moment, not a property the configuration keeps.** Anything
+that writes to infrastructure outside Terraform — here, a deploy pipeline —
+can break it later. The check that matters is a plan run *after* the other
+system has done its work.
+
+`image_uri` is also now `:latest` rather than a pinned SHA. The value is only
+read when the function is *created*, since `ignore_changes` covers it
+afterwards — but that is exactly the rebuild-from-scratch case, where a pinned
+SHA would quietly resurrect old code during a recovery.
 
 ### CI
 
