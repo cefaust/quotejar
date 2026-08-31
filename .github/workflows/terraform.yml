@@ -1,0 +1,92 @@
+name: Terraform
+
+# Runs on every push and every pull request, deliberately without a
+# `paths: terraform/**` filter.
+#
+# A paths filter looks like an easy saving and interacts badly with branch
+# protection: a required check that is filtered out never reports at all, and
+# GitHub waits for a status that will never arrive, so the PR is blocked
+# forever with no way to tell that from a slow runner. This job takes about
+# twenty seconds. That is cheaper than the confusion.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only, and that is the whole security posture of this workflow.
+#
+# **No AWS credentials are configured here, on purpose.** The tempting next
+# step is `terraform plan` on the PR so reviewers see what would change. It was
+# considered and declined, because `terraform plan` is not a read-only report
+# -- it *executes code*. Providers are downloaded and run, and an `external`
+# data source shells out to whatever it is pointed at. The config being
+# planned is the config in the pull request, which anyone able to open a PR
+# controls.
+#
+# So a plan job holding credentials is arbitrary code execution against this
+# account, gated only by who can open a pull request. With the deploy role
+# that means write access; even a read-only role means a PR can enumerate the
+# account. Neither is worth the convenience of seeing a diff in a comment when
+# one person runs apply from a laptop.
+#
+# What a plan would have caught that this does not: attribute drift, and
+# whether a change forces replacement. That check still happens -- it happens
+# in the local plan, which is the same place the apply happens. See README,
+# "Making an infrastructure change".
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: terraform fmt and validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          # Pinned to the same minor range as required_version in versions.tf.
+          # A newer Terraform writes a state file older versions cannot read,
+          # and CI silently running ahead of every laptop is how that happens.
+          terraform_version: "~1.15.0"
+          # The wrapper rewrites stdout to inject its own markers, which turns
+          # `fmt -diff` output into noise. Nothing here needs the outputs it
+          # provides.
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        # -check fails rather than rewriting; -diff prints what it wanted to
+        # change, so a failure is actionable from the log instead of sending
+        # you back to run it locally to find out what it disliked.
+        run: terraform fmt -check -diff -recursive
+
+      - name: terraform init
+        # -backend=false is what lets this job exist without credentials.
+        #
+        # A normal init contacts S3 to read state, which needs AWS access. The
+        # backend is not needed to check syntax and types: validate works
+        # against the configuration and the provider schemas, not against
+        # state. So init here does exactly one useful thing -- download the
+        # providers so their schemas are available -- and skips the part that
+        # would require secrets.
+        #
+        # The cost is honest: without state, validate cannot catch anything
+        # that depends on real values. It will not tell you a resource drifted
+        # or that a change forces replacement.
+        run: terraform init -backend=false
+
+      - name: terraform validate
+        # Catches malformed HCL, unknown attributes, wrong types, and
+        # references to resources that do not exist -- the errors that
+        # otherwise surface halfway through an apply, after some resources
+        # have already changed.
+        run: terraform validate -no-color
