@@ -10,19 +10,44 @@
 # produce.
 
 resource "aws_lambda_function" "api" {
-  architectures                        = ["x86_64"]
-  code_sha256                          = "11d977d19832a31de223bc255ac4e000d605dd0c0a3b17924996b4ae4db62d66"
-  code_signing_config_arn              = null
-  description                          = "QuoteJar API (FastAPI via Mangum) - QJ-3 - coldstart probe db 1786333836"
-  filename                             = null
-  function_name                        = "quotejar-api"
-  handler                              = null
-  image_uri                            = "${aws_ecr_repository.app.repository_url}:66ef1a1e021c912957442cd0717135f0ce21322e"
-  kms_key_arn                          = null
-  layers                               = []
-  memory_size                          = var.lambda_memory_mb
-  package_type                         = "Image"
-  publish                              = null
+  architectures = ["x86_64"]
+
+  # code_sha256 is deliberately absent.
+  #
+  # It is the digest of the deployed image -- a *description of the artefact*,
+  # not a setting anyone declares. `-generate-config-out` emitted it as a
+  # literal because it was reading a live resource, and a literal here pins the
+  # config to whichever image happened to be deployed the day the config was
+  # generated.
+  #
+  # Omitting it lets the provider treat it as computed: Terraform records
+  # whatever is deployed and never proposes changing it.
+  code_signing_config_arn = null
+  description             = "QuoteJar API (FastAPI via Mangum) - QJ-3 - coldstart probe db 1786333836"
+  filename                = null
+  function_name           = "quotejar-api"
+  handler                 = null
+  # :latest, not a pinned SHA -- and this value is only ever read when the
+  # function is *created*, since ignore_changes covers it thereafter.
+  #
+  # That creation case is the whole reason to care. A pinned SHA here means a
+  # rebuild from scratch resurrects whichever image was current the day this
+  # config was generated, quietly deploying old code during a recovery. :latest
+  # gets whatever CD pushed most recently.
+  #
+  # cd.yml deliberately *deploys* by SHA and never by :latest, because a
+  # mutable tag makes "what is running" unanswerable. That reasoning applies to
+  # routine deploys; here the alternative is a tag that is guaranteed stale.
+  image_uri    = "${aws_ecr_repository.app.repository_url}:latest"
+  kms_key_arn  = null
+  layers       = []
+  memory_size  = var.lambda_memory_mb
+  package_type = "Image"
+  # false, not null. AWS stores no value at all here, so an unset attribute
+  # plans as a change on every single run -- a permanent one-line diff that
+  # teaches you to skim plan output, which is the habit that lets a
+  # "forces replacement" line on the RDS instance slip past.
+  publish                              = false
   publish_to                           = null
   replace_security_groups_on_destroy   = null
   replacement_security_group_ids       = null
@@ -80,7 +105,14 @@ resource "aws_lambda_function" "api" {
   # apply with write credentials, which is exactly what the CI decision in
   # this ticket avoided.
   lifecycle {
-    ignore_changes = [image_uri, description]
+    # code_sha256 is listed as well as omitted above, deliberately.
+    #
+    # Omitting it from config is what stops the diff today. This entry is the
+    # guard against someone re-adding it -- most plausibly by regenerating the
+    # config with `-generate-config-out`, which emits it as a literal every
+    # time. Without it, the first deploy after such a regeneration puts the
+    # rollback back.
+    ignore_changes = [image_uri, code_sha256, description]
   }
 }
 
